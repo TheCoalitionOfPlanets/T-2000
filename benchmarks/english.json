@@ -1,0 +1,10 @@
+[
+  {"id": "short", "text": "Hello, this is a voice test."},
+  {"id": "amounts", "text": "The total is forty two dollars, due on October twenty ninth."},
+  {"id": "medium", "text": "Please leave the parcel beside the blue door when you arrive."},
+  {"id": "names", "text": "Maya and Daniel will meet Priya at the station tomorrow morning."},
+  {"id": "question", "text": "Could you tell me whether the train leaves before seven?"},
+  {"id": "contrast", "text": "I asked for the blue folder, but you brought the green one."},
+  {"id": "pauses", "text": "Wait! Before we continue, please check the address. Is it correct?"},
+  {"id": "paragraph", "text": "The first experiment should measure how quickly the speech begins and whether it can continue without a pause. We should also listen for clear pronunciation, natural rhythm, and a convincing match to the reference speaker."}
+]

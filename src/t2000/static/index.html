@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>T-2000 · Voice Studio</title>
+  <link rel="stylesheet" href="/static/studio.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="T-2000 Voice Studio"><span class="brand-mark" aria-hidden="true">T</span><span>T-2000 <small>VOICE STUDIO</small></span></a>
+      <span id="runtime-status" class="runtime-status" role="status"><i aria-hidden="true"></i>Connecting</span>
+    </header>
+    <main>
+      <div class="intro"><p class="eyebrow">YOUR VOICE, NEW WORDS</p><h1>Make it sound like you.</h1><p>A reference voice. Your words. Speech you can hear as it’s generated.</p></div>
+      <div class="studio-grid">
+        <section class="panel reference-panel" aria-labelledby="reference-title">
+          <div class="panel-heading"><span class="step">01</span><h2 id="reference-title">Reference voice</h2></div>
+          <label for="profile-select">Saved voices</label>
+          <select id="profile-select"><option value="">No voices yet</option></select>
+          <div class="reference-actions">
+            <button id="record-button" type="button" class="button secondary"><span id="record-dot" class="record-dot" aria-hidden="true"></span><span id="record-label">Record voice</span></button>
+            <label class="button secondary upload-button" for="reference-file">Upload WAV<input id="reference-file" type="file" accept=".wav,audio/wav,audio/x-wav"></label>
+          </div>
+          <p id="capture-status" class="hint">Record a clear 3–15 second sample. Up to 30 seconds.</p>
+          <audio id="reference-player" controls hidden preload="metadata" aria-label="Reference recording"></audio>
+          <div id="draft-fields" hidden>
+            <label for="voice-name">Voice name</label><input id="voice-name" type="text" maxlength="80" placeholder="My voice" autocomplete="off">
+          </div>
+          <div id="transcript-section">
+            <label for="reference-transcript">Reference transcript <span class="optional">optional</span></label>
+            <textarea id="reference-transcript" rows="3" maxlength="4000" placeholder="The words in your recording…"></textarea>
+            <label id="transcribe-label" class="checkbox-label"><input id="auto-transcribe" type="checkbox"> Transcribe this recording</label>
+            <p class="hint small">Automatic transcription requires the CPU recognition model.</p>
+          </div>
+          <button id="save-reference" type="button" class="button secondary full-width" disabled>Save reference voice</button>
+          <button id="save-transcript" type="button" class="text-button" hidden>Save transcript</button>
+          <button id="prepare-voice" type="button" class="button secondary full-width" hidden>Prepare voice for generation</button>
+          <div id="reference-summary" class="reference-summary" hidden></div>
+        </section>
+        <section class="panel generation-panel" aria-labelledby="generation-title">
+          <div class="panel-heading"><span class="step">02</span><h2 id="generation-title">What should it say?</h2></div>
+          <label class="sr-only" for="speech-text">Text to generate</label>
+          <textarea id="speech-text" class="speech-editor" maxlength="3000" placeholder="Write something you’d like to hear in this voice…" spellcheck="true">Hello. This is my voice, with something new to say.</textarea>
+          <div class="editor-footer"><span>English · phrase-by-phrase playback</span><span id="character-count">0 / 3,000</span></div>
+          <div class="generation-settings">
+            <div class="speed-setting"><label for="speech-speed">Speaking speed <output id="speed-value" for="speech-speed">1.0×</output></label><input id="speech-speed" type="range" min="0.7" max="1.4" step="0.05" value="1"></div>
+            <div class="seed-setting"><label for="speech-seed">Seed</label><input id="speech-seed" type="number" min="0" max="4294967295" step="1" value="42"></div>
+          </div>
+          <div class="generation-actions"><button id="generate-button" type="button" class="button primary">Generate speech <span aria-hidden="true">↗</span></button><button id="stop-button" type="button" class="button secondary" disabled>Stop</button><span class="keyboard-hint">⌘ / Ctrl + Enter</span></div>
+          <p id="session-status" class="session-status" role="status" aria-live="polite">Add or select a reference voice to begin.</p>
+          <div class="metrics" aria-label="Generation measurements">
+            <div><span>First audible <small>estimated</small></span><strong id="metric-audible">—</strong></div>
+            <div><span>Generation</span><strong id="metric-generation">—</strong></div>
+            <div><span>Real-time factor</span><strong id="metric-rtf">—</strong></div>
+            <div><span>Playback gaps</span><strong id="metric-gaps">—</strong></div>
+          </div>
+          <div id="output-section" class="output-section" hidden><div class="output-heading"><h3>Generated speech</h3><a id="download-link" class="text-button" download="t2000-speech.wav">Download WAV ↓</a></div><audio id="output-player" controls preload="metadata" aria-label="Generated speech"></audio></div>
+        </section>
+      </div>
+      <section id="analysis-panel" class="panel analysis-panel" aria-labelledby="analysis-title" hidden>
+        <div class="analysis-heading"><div><p class="eyebrow">REFERENCE DETAILS</p><h2 id="analysis-title">A closer listen.</h2></div><span class="hint">Acoustic diagnostics · pitch is approximate</span></div>
+        <div class="plots"><figure><figcaption>Waveform <span>Amplitude over time</span></figcaption><canvas id="waveform-plot" role="img" aria-label="Reference waveform"></canvas></figure><figure><figcaption>Pitch <span>Fundamental frequency</span></figcaption><canvas id="pitch-plot" role="img" aria-label="Approximate reference pitch"></canvas></figure><figure><figcaption>Spectrum <span>Relative energy by frequency</span></figcaption><canvas id="spectrum-plot" role="img" aria-label="Reference frequency spectrum"></canvas></figure></div>
+      </section>
+    </main>
+    <footer>Generated locally. <span>Reference analysis is cached between requests.</span></footer>
+  </div>
+  <script type="module" src="/static/studio.js"></script>
+</body>
+</html>

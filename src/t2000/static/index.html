@@ -26,7 +26,18 @@
           </div>
           <p id="capture-status" class="hint">Record a clear 3–15 second sample. Up to 30 seconds.</p>
           <audio id="reference-player" controls hidden preload="metadata" aria-label="Reference recording"></audio>
+          <button id="edit-reference" type="button" class="text-button" hidden>Clean up or trim this voice</button>
           <div id="draft-fields" hidden>
+            <fieldset class="reference-editor" id="reference-editor">
+              <legend>Clean up and trim</legend>
+              <label class="checkbox-label"><input id="noise-reduction" type="checkbox" checked> Reduce background noise</label>
+              <label class="checkbox-label"><input id="auto-trim" type="checkbox"> Trim quiet edges automatically</label>
+              <div class="crop-fields"><div><label for="trim-start">Start (seconds)</label><input id="trim-start" type="number" min="0" step="0.01" value="0" inputmode="decimal"></div><div><label for="trim-end">End (seconds)</label><input id="trim-end" type="number" min="0" step="0.01" placeholder="Full recording" inputmode="decimal"></div></div>
+              <p class="hint small">Keep at least 1 second. Background suppression reduces steady hiss and hum; competing voices or music may remain.</p>
+              <div class="cleanup-actions"><button id="preview-reference" type="button" class="button secondary">Preview changes</button><button id="reset-reference" type="button" class="text-button">Reset edits</button></div>
+              <button id="compare-reference" type="button" class="text-button" hidden>Listen to original</button>
+              <p id="cleanup-status" class="hint small" role="status" aria-live="polite">Preview your changes before saving.</p>
+            </fieldset>
             <label for="voice-name">Voice name</label><input id="voice-name" type="text" maxlength="80" placeholder="My voice" autocomplete="off">
           </div>
           <div id="transcript-section">

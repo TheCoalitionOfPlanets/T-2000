@@ -94,8 +94,22 @@ if (process.env.T2000_BROWSER_URL) {
       for (let i = 0; i < frames; i++) wav.writeFloatLE(0.18 * Math.sin(2 * Math.PI * 173 * i / rate), 44 + i * 4);
       await page.locator('#reference-file').setInputFiles({ name: 'browser-check.wav', mimeType: 'audio/wav', buffer: wav });
       await page.locator('#voice-name').fill('Browser transport check');
+      assert.equal(await page.locator('#noise-reduction').isChecked(), true);
+      assert.equal(await page.locator('#save-reference').isDisabled(), true, 'unreviewed edits must be previewed');
+      await page.locator('#reference-transcript').fill('Words before cropping');
+      await page.locator('#trim-start').fill('0.25');
+      await page.locator('#trim-end').fill('1.75');
+      assert.equal(await page.locator('#reference-transcript').inputValue(), '', 'crop changes clear stale words');
+      await page.locator('#preview-reference').click();
+      await page.locator('#cleanup-status').filter({ hasText: 'Preview ready' }).waitFor();
+      const previewSource = await page.locator('#reference-player').getAttribute('src');
+      await page.locator('#compare-reference').click();
+      assert.notEqual(await page.locator('#reference-player').getAttribute('src'), previewSource);
+      await page.locator('#compare-reference').click();
+      assert.equal(await page.locator('#reference-player').getAttribute('src'), previewSource);
       await page.locator('#save-reference').click();
       await page.locator('#session-status').filter({ hasText: 'Reference saved.' }).waitFor();
+      assert.match(await page.locator('#reference-summary').textContent(), /1\.5 seconds/);
       assert.equal(await page.locator('#analysis-panel').isVisible(), true);
       await page.locator('#reference-transcript').fill('Reference for transport checks.');
       await page.locator('#save-transcript').click();
@@ -118,7 +132,11 @@ if (process.env.T2000_BROWSER_URL) {
       await page.locator('#record-button').click();
       await page.locator('#capture-status').filter({ hasText: 'seconds captured at' }).waitFor();
       assert.equal(await page.locator('#generate-button').isDisabled(), true, 'unsaved references must not generate using an old voice');
-      console.log('Browser integration passed: WAV enrollment, graphs, transcript edit, preparation, streaming playback, audible timing, download, mobile layout, microphone finalization, and draft isolation. Test-double timings are not inference benchmarks.');
+      await page.locator('#reset-reference').click();
+      assert.equal(await page.locator('#trim-start').inputValue(), '0');
+      assert.equal(await page.locator('#trim-end').inputValue(), '');
+      assert.equal(await page.locator('#save-reference').isDisabled(), true);
+      console.log('Browser integration passed: cleanup/crop preview and comparison, immutable WAV enrollment, graphs, transcript edit, preparation, streaming playback, audible timing, download, mobile layout, microphone finalization, and draft isolation. Test-double timings are not inference benchmarks.');
     }
     assert.equal(errors.length, 0, errors.join('\n'));
     console.log('Browser studio loaded without JavaScript errors.');

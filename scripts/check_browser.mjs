@@ -80,9 +80,13 @@ if (process.env.T2000_BROWSER_URL) {
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(process.env.T2000_BROWSER_URL);
-    await page.getByRole('heading', { name: 'Make it sound like you.' }).waitFor();
+    await page.getByRole('heading', { name: 'Good words. Great voice.' }).waitFor();
     await page.waitForFunction(() => !document.getElementById('runtime-status').textContent.includes('Connecting'));
     assert.equal(await page.getByLabel('Text to generate').inputValue(), 'Hello. This is my voice, with something new to say.');
+    assert.equal(await page.locator('#auto-transcribe').isChecked(), true, 'reference transcription defaults on');
+    await page.getByRole('button', { name: 'Quick guide' }).click();
+    await page.getByRole('dialog', { name: 'Make yourself heard.' }).waitFor();
+    await page.getByRole('button', { name: 'Close getting started' }).click();
     if (process.env.T2000_BROWSER_INTEGRATION === '1') {
       const rate = 48000, frames = rate * 2;
       const wav = Buffer.alloc(44 + frames * 4);
@@ -93,15 +97,19 @@ if (process.env.T2000_BROWSER_URL) {
       wav.writeUInt32LE(frames * 4, 40);
       for (let i = 0; i < frames; i++) wav.writeFloatLE(0.18 * Math.sin(2 * Math.PI * 173 * i / rate), 44 + i * 4);
       await page.locator('#reference-file').setInputFiles({ name: 'browser-check.wav', mimeType: 'audio/wav', buffer: wav });
+      await page.locator('#auto-transcribe').uncheck(); // Transport test signals contain no speech.
       await page.locator('#voice-name').fill('Browser transport check');
       await page.locator('#save-reference').click();
       await page.locator('#session-status').filter({ hasText: 'Reference saved.' }).waitFor();
       assert.equal(await page.locator('#analysis-panel').isVisible(), true);
+      assert.equal(await page.locator('#reference-guidance').isVisible(), true, 'short references get guidance while remaining usable');
       await page.locator('#reference-transcript').fill('Reference for transport checks.');
       await page.locator('#save-transcript').click();
       await page.locator('#session-status').filter({ hasText: 'Transcript saved.' }).waitFor();
+      await page.locator('#reference-transcript').fill('Updated transcript for voice preparation.');
       await page.locator('#prepare-voice').click();
       await page.locator('#session-status').filter({ hasText: 'Voice prepared.' }).waitFor();
+      assert.equal(await page.locator('#reference-transcript').inputValue(), 'Updated transcript for voice preparation.', 'preparation saves pending manual corrections before reloading the transcript');
       await page.locator('#speech-text').fill('Hello there! This is a second phrase.');
       await page.locator('#generate-button').click();
       await page.locator('#output-section').waitFor({ state: 'visible' });
@@ -122,5 +130,116 @@ if (process.env.T2000_BROWSER_URL) {
     }
     assert.equal(errors.length, 0, errors.join('\n'));
     console.log('Browser studio loaded without JavaScript errors.');
+
+    // The switch contract is exercised on a separate page with only its API
+    // intercepted: the served product HTML/JS/CSS and DOM events are unchanged.
+    const enginePage = await browser.newPage();
+    const engineErrors = [];
+    enginePage.on('pageerror', (error) => engineErrors.push(error.message));
+    const referenceId = 'a'.repeat(64);
+    const shortReferenceId = 'b'.repeat(64);
+    const profiles = [{ id: referenceId, name: 'Seven second voice', transcript: 'Original recording words.',
+      duration_seconds: 7, sample_rate: 24000, analysis: {} },
+    { id: shortReferenceId, name: 'Five second voice', transcript: 'Five second recording words.',
+      duration_seconds: 5, sample_rate: 24000, analysis: {} }];
+    const available = [
+      { id: 'f5-tts-v1', available: true }, { id: 't1000-soar', available: true },
+      { id: 't1000-mf2', available: false }, { id: 'melo-openvoice-v2', available: true },
+    ];
+    let currentEngine = 'f5-tts-v1', failSwitch = false, releaseSwitch, generatedRequest;
+    let preparedDelivery = { speech_seconds: 1.454, duration_seconds: 5, speech_fraction: 0.29,
+      pace: { requires_transcript_review: true } };
+    const switchRequests = [];
+    const runtime = () => ({ backend: currentEngine, loaded: false, max_reference_seconds: currentEngine === 't1000-soar' ? 6 : 12,
+      available_backends: available, delivery_planner: { enabled: true }, stt: { available: true },
+      speed_control: { enabled: currentEngine !== 't1000-soar', default: 1.0, method: 'native_reference' } });
+    await enginePage.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === '/api/status') return route.fulfill({ json: runtime() });
+      if (path === '/api/profiles') return route.fulfill({ json: profiles });
+      if (path === `/api/profiles/${shortReferenceId}/prepare`) return route.fulfill({ json: { ready: true, delivery_profile: preparedDelivery } });
+      if (path === `/api/profiles/${referenceId}` && route.request().method() === 'PATCH') {
+        const update = route.request().postDataJSON();
+        profiles[0].transcript = update.transcript;
+        switchRequests.push('transcript');
+        return route.fulfill({ json: profiles[0] });
+      }
+      if (path === '/api/backend') {
+        switchRequests.push(route.request().postDataJSON().backend);
+        await new Promise((resolve) => { releaseSwitch = resolve; });
+        if (failSwitch) return route.fulfill({ status: 409, json: { detail: 'Wait for the current generation to finish.' } });
+        currentEngine = route.request().postDataJSON().backend;
+        return route.fulfill({ json: runtime() });
+      }
+      return route.fulfill({ status: 404, json: { detail: 'Not used by the engine-switch check.' } });
+    });
+    await enginePage.routeWebSocket('**/api/generate', (socket) => {
+      socket.onMessage((message) => {
+        const request = JSON.parse(message);
+        if (!request.profile_id) return;
+        generatedRequest = request;
+        socket.send(JSON.stringify({ type: 'error', message: 'Engine speed request captured.' }));
+        socket.close();
+      });
+    });
+    await enginePage.goto(process.env.T2000_BROWSER_URL);
+    await enginePage.locator('#voice-engine').waitFor({ state: 'visible' });
+    await enginePage.waitForFunction(() => document.getElementById('profile-select').value === 'a'.repeat(64));
+    assert.equal(await enginePage.locator('#voice-engine option').count(), 3, 'unavailable engines are omitted');
+    assert.equal(await enginePage.locator('#delivery-planner-status').isVisible(), true);
+    await enginePage.locator('#speech-speed').fill('1.15');
+    await enginePage.locator('#speech-speed').dispatchEvent('input');
+    await enginePage.locator('#reference-transcript').fill('Corrected exact reference words.');
+    await enginePage.locator('#voice-engine').selectOption('t1000-soar');
+    await enginePage.waitForFunction(() => document.getElementById('session-status').textContent.includes('Changing voice engine'));
+    assert.equal(await enginePage.locator('#reference-transcript').isDisabled(), true);
+    assert.equal(await enginePage.locator('#record-button').isDisabled(), true);
+    assert.equal(await enginePage.locator('#generate-button').isDisabled(), true);
+    while (!releaseSwitch) await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseSwitch(); releaseSwitch = null;
+    await enginePage.locator('#session-status').filter({ hasText: 'Choose a reference of 6 seconds or less' }).waitFor();
+    assert.deepEqual(switchRequests, ['transcript', 't1000-soar'], 'manual transcript is saved before switching');
+    assert.equal(await enginePage.locator('#profile-select').inputValue(), referenceId, 'switching keeps the selected voice');
+    assert.equal(await enginePage.locator('#reference-transcript').inputValue(), 'Corrected exact reference words.');
+    assert.equal(await enginePage.locator('#generate-button').isDisabled(), true, 'new engine reference cap is enforced');
+    assert.match(await enginePage.locator('#reference-description').textContent(), /3–6 seconds/);
+    assert.match(await enginePage.locator('#engine-name').textContent(), /T-1000 SOAR/);
+    assert.equal(await enginePage.locator('#speech-speed').inputValue(), '1');
+    assert.equal(await enginePage.locator('#speed-value').textContent(), '1.0×');
+    assert.equal(await enginePage.locator('#speech-speed').isDisabled(), true, 'native reference delivery has no unsupported speed control');
+    assert.equal(await enginePage.locator('#speech-speed-label').textContent(), 'Reference delivery');
+    failSwitch = true;
+    await enginePage.locator('#voice-engine').selectOption('f5-tts-v1');
+    while (!releaseSwitch) await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseSwitch(); releaseSwitch = null;
+    await enginePage.locator('#session-status').filter({ hasText: 'Wait for the current generation to finish.' }).waitFor();
+    assert.equal(await enginePage.locator('#voice-engine').inputValue(), 't1000-soar', 'failed switch restores actual active engine');
+    assert.equal(await enginePage.locator('#reference-transcript').isDisabled(), false);
+    assert.equal(await enginePage.locator('#profile-select').inputValue(), referenceId);
+    await enginePage.locator('#profile-select').selectOption(shortReferenceId);
+    await enginePage.locator('#generate-button').click();
+    await enginePage.locator('#session-status').filter({ hasText: 'Engine speed request captured.' }).waitFor();
+    assert.equal(generatedRequest.speed, 1, 'T-1000 generation always requests its native speed');
+    await enginePage.waitForFunction(() => !document.getElementById('voice-engine').disabled);
+    failSwitch = false;
+    await enginePage.locator('#voice-engine').selectOption('f5-tts-v1');
+    while (!releaseSwitch) await new Promise((resolve) => setTimeout(resolve, 10));
+    releaseSwitch(); releaseSwitch = null;
+    await enginePage.locator('#session-status').filter({ hasText: 'Engine changed. Prepare your voice' }).waitFor();
+    assert.equal(await enginePage.locator('#speech-speed').isDisabled(), false);
+    assert.equal(await enginePage.locator('#speech-speed').inputValue(), '1.15', 'adjustable engines restore the earlier pace');
+    await enginePage.locator('#prepare-voice').click();
+    await enginePage.locator('#session-status').filter({ hasText: 'Voice prepared.' }).waitFor();
+    assert.match(await enginePage.locator('#reference-guidance').textContent(), /Only about 1.5 seconds of speech were detected.*accent and expression/);
+    assert.equal(await enginePage.locator('#generate-button').isDisabled(), false, 'speech-content guidance is nonblocking');
+    preparedDelivery = undefined;
+    await enginePage.locator('#prepare-voice').click();
+    await enginePage.locator('#session-status').filter({ hasText: 'Voice prepared.' }).waitFor();
+    assert.equal(await enginePage.locator('#reference-guidance').isVisible(), false, 'missing delivery metadata is supported without a stale warning');
+    await enginePage.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await enginePage.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    assert.deepEqual(engineErrors, []);
+    await enginePage.close();
+    console.log('Browser engine switch passed: availability, saved transcript ordering, pending-operation lock, reference limits, selected voice preservation, server rejection recovery, and mobile layout.');
   } finally { await browser.close(); }
 }

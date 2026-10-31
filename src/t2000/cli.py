@@ -18,7 +18,8 @@ def main():
     enroll.add_argument("reference", type=Path)
     enroll.add_argument("--name", default="Reference")
     enroll.add_argument("--transcript", default="")
-    enroll.add_argument("--transcribe", action="store_true")
+    enroll.add_argument("--transcribe", action=argparse.BooleanOptionalAction, default=True,
+                        help="Transcribe new references by default; --no-transcribe opts out")
     enroll.add_argument("--prepare", action="store_true")
     generate = sub.add_parser("generate", help="Generate a complete WAV using an enrolled profile")
     generate.add_argument("--profile", required=True)
@@ -50,14 +51,23 @@ def main():
                 app.state.engine.loaded = True
             uvicorn.run(app, host=args.host, port=args.port, ws_max_size=65536)
         elif args.command == "enroll":
+            if engine.max_reference_seconds < 30:
+                from .audio import load_audio
+
+                load_audio(args.reference, max_seconds=engine.max_reference_seconds)
             profile = store.create(args.reference, args.name, args.transcript)
-            if args.transcribe:
+            if args.transcript.strip() and profile["transcript"] != args.transcript.strip():
+                profile = store.update_transcript(profile["id"], args.transcript)
+            if args.transcribe and not profile["transcript"]:
                 from .stt import transcribe_file
 
-                profile = store.update_transcript(profile["id"], transcribe_file(
-                    store.reference_path(profile["id"]), model_dir=settings.stt_model_dir,
-                    num_threads=settings.num_threads, max_seconds=30,
-                ))
+                try:
+                    profile = store.update_transcript(profile["id"], transcribe_file(
+                        store.reference_path(profile["id"]), model_dir=settings.stt_model_dir,
+                        num_threads=settings.num_threads, max_seconds=30,
+                    ), only_if_empty=True)
+                except T2000Error as exc:
+                    profile = dict(profile, transcription_error=str(exc))
             if args.prepare:
                 engine.prepare_profile(profile["id"])
             print(json.dumps(profile, indent=2))

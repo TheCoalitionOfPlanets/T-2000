@@ -34,6 +34,11 @@ class TranscriptUpdate(BaseModel):
     transcript: str = Field(max_length=5000)
 
 
+class BackendUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    backend: str = Field(pattern=r"^(f5-tts-v1|melo-openvoice-v2|t1000-soar|t1000-mf2)$")
+
+
 def _same_origin(origin: str | None, host: str) -> bool:
     if origin is None:
         return True  # Non-browser CLI clients do not send Origin.
@@ -45,7 +50,14 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
     settings = settings or Settings.from_env()
     store = ProfileStore(settings.data_dir / "profiles")
     engine = Engine(settings, store, backend)
-    app = FastAPI(title="T-2000", version="0.1.0")
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(engine.close)
+
+    app = FastAPI(title="T-2000", version="0.1.0", lifespan=lifespan)
     app.state.engine = engine
     app.state.store = store
     # One running request plus one waiter; model calls cannot be interrupted mid-kernel.
@@ -67,6 +79,19 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
     def status():
         return engine.status()
 
+    @app.post("/api/backend")
+    async def select_backend(update: BackendUpdate):
+        acquired = 0
+        try:
+            for _ in range(2):
+                if not slots.acquire(blocking=False):
+                    raise HTTPException(status_code=409, detail="Wait for speech generation before changing engines.")
+                acquired += 1
+            return await asyncio.to_thread(engine.switch_backend, update.backend)
+        finally:
+            for _ in range(acquired):
+                slots.release()
+
     @app.get("/api/profiles")
     def profiles():
         return store.list()
@@ -74,7 +99,7 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
     @app.post("/api/profiles", status_code=201)
     async def enroll(
         file: UploadFile = File(...), name: str = Form("Reference"),
-        transcript: str = Form(""), transcribe: bool = Form(False),
+        transcript: str = Form(""), transcribe: bool = Form(True),
     ):
         if not 1 <= len(name.strip()) <= 120 or len(transcript) > 5000:
             raise T2000Error("Use a voice name of 1–120 characters and a transcript under 5000 characters.")
@@ -90,8 +115,14 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
                     if total > settings.max_upload_bytes:
                         raise HTTPException(status_code=413, detail="Reference upload exceeds 16 MB.")
                     out.write(block)
+            if engine.max_reference_seconds < 30:
+                from .audio import load_audio
+
+                await asyncio.to_thread(load_audio, path, max_seconds=engine.max_reference_seconds)
             profile = await asyncio.to_thread(store.create, path, name.strip(), transcript.strip())
-            if transcribe:
+            if transcript.strip() and profile["transcript"] != transcript.strip():
+                profile = await asyncio.to_thread(store.update_transcript, profile["id"], transcript.strip())
+            if transcribe and not profile["transcript"]:
                 from .stt import transcribe_file
 
                 try:
@@ -99,7 +130,8 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
                         transcribe_file, store.reference_path(profile["id"]),
                         model_dir=settings.stt_model_dir, num_threads=settings.num_threads, max_seconds=30,
                     )
-                    profile = await asyncio.to_thread(store.update_transcript, profile["id"], words)
+                    profile = await asyncio.to_thread(store.update_transcript, profile["id"], words,
+                                                      only_if_empty=True)
                 except T2000Error as exc:
                     # Preserve a valid reference if optional transcription is unavailable.
                     profile = dict(profile, transcription_error=str(exc))

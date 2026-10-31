@@ -1,4 +1,7 @@
+import fcntl
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +13,15 @@ import soundfile as sf
 from t2000.audio import Audio, analyze_audio, load_audio
 from t2000.errors import T2000Error
 from t2000.profiles import ProfileStore
+
+
+def _automatic_transcript(root, profile_id, started, finished, result):
+    started.set()
+    try:
+        profile = ProfileStore(root).update_transcript(profile_id, "Late recognition", only_if_empty=True)
+        result.put(profile["transcript"])
+    finally:
+        finished.set()
 
 
 class ProfileTests(unittest.TestCase):
@@ -85,6 +97,49 @@ class ProfileTests(unittest.TestCase):
         sf.write(self.source, self.samples * 0.8, self.rate, subtype="FLOAT")
         changed_audio = self.store.create(self.source, "Changed audio")
         self.assertNotEqual(first["id"], changed_audio["id"])
+
+    def test_automatic_transcript_fills_empty_but_preserves_corrections_and_manual_replacement(self):
+        with self.assertRaisesRegex(T2000Error, "unavailable"):
+            self.store.update_transcript("a" * 64, "Missing profile")
+        profile = self.store.create(self.source, "Voice")
+        updated = self.store.update_transcript(profile["id"], "Recognition", only_if_empty=True)
+        self.assertEqual(updated["transcript"], "Recognition")
+        self.store.update_transcript(profile["id"], "Manual correction")
+        skipped = self.store.update_transcript(profile["id"], "Late recognition", only_if_empty=True)
+        self.assertEqual(skipped["transcript"], "Manual correction")
+        replaced = self.store.update_transcript(profile["id"], "Explicit replacement")
+        self.assertEqual(replaced["transcript"], "Explicit replacement")
+        self.assertFalse(list((self.store.root / profile["id"]).glob(".metadata-*")))
+
+    def test_late_recognition_waits_for_cross_process_lock_then_reads_current_transcript(self):
+        profile = self.store.create(self.source, "Voice")
+        directory = self.store.root / profile["id"]
+        guard = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        context = multiprocessing.get_context("spawn")
+        started, finished, result = context.Event(), context.Event(), context.Queue()
+        process = context.Process(target=_automatic_transcript,
+                                  args=(self.store.root, profile["id"], started, finished, result))
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            process.start()
+            self.assertTrue(started.wait(10))
+            self.assertFalse(finished.wait(0.1))
+            # Simulate the manual writer already inside its locked atomic update.
+            metadata = self.store.get(profile["id"])
+            metadata["transcript"] = "Correction saved while recognition waited"
+            (directory / "metadata.json").write_text(json.dumps(metadata))
+            fcntl.flock(guard, fcntl.LOCK_UN)
+            self.assertTrue(finished.wait(10))
+            process.join(10)
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(result.get(timeout=5), metadata["transcript"])
+            self.assertEqual(self.store.get(profile["id"])["transcript"], metadata["transcript"])
+        finally:
+            os.close(guard)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+            result.close()
 
     def test_traversal_invalid_names_and_damaged_artifacts(self):
         for invalid in ("../outside", "a" * 63, "A" * 64, "", "a/b", None):

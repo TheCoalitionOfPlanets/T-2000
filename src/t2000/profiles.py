@@ -12,7 +12,7 @@ import tempfile
 import numpy as np
 import soundfile as sf
 
-from .audio import PREPROCESSING_VERSION, analyze_audio, load_audio
+from .audio import PREPROCESSING_VERSION, analyze_audio, prepare_reference
 from .errors import T2000Error
 
 
@@ -33,13 +33,21 @@ class ProfileStore:
             raise T2000Error("The reference profile directory must not be a symbolic link.")
         return directory
 
-    def create(self, source_path: Path, name: str, transcript: str = "") -> dict:
+    def create(self, source_path: Path, name: str, transcript: str = "", *, start_seconds: float = 0,
+               end_seconds: float | None = None, noise_reduction: bool = False, auto_trim: bool = False,
+               max_seconds: float = 30) -> dict:
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
             raise T2000Error("Use a reference name between 1 and 120 characters.")
         transcript = self._transcript(transcript)
-        audio = load_audio(source_path)
+        audio = prepare_reference(source_path, start_seconds=start_seconds, end_seconds=end_seconds,
+                                  noise_reduction=noise_reduction, auto_trim=auto_trim)
+        # Engine limits apply to the kept speech, before creating any profile artifacts.
+        if audio.duration_seconds > max_seconds:
+            raise T2000Error(f"Use a reference of {max_seconds:g} seconds or less after cleanup and trimming.")
+        processed = noise_reduction or auto_trim or start_seconds != 0 or end_seconds is not None
+        preprocessing_version = PREPROCESSING_VERSION + ("-cleanup-v1" if processed else "")
         digest = hashlib.sha256()
-        digest.update(f"{PREPROCESSING_VERSION}\n{audio.sample_rate}\n".encode())
+        digest.update(f"{preprocessing_version}\n{audio.sample_rate}\n".encode())
         digest.update(np.asarray(audio.samples, dtype="<f4").tobytes())
         profile_id = digest.hexdigest()
         directory = self._directory(profile_id)
@@ -51,13 +59,21 @@ class ProfileStore:
             reference = staged / "reference.wav"
             sf.write(reference, audio.samples, audio.sample_rate, subtype="FLOAT")
             metadata = {
-                "schema_version": SCHEMA_VERSION, "preprocessing_version": PREPROCESSING_VERSION,
+                "schema_version": SCHEMA_VERSION, "preprocessing_version": preprocessing_version,
                 "id": profile_id, "name": name.strip(), "transcript": transcript,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "sample_rate": audio.sample_rate, "duration_seconds": audio.duration_seconds,
                 "audio_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
                 "analysis": analyze_audio(audio),
+                "reference_processing": {"version": "cleanup-v1", "start_seconds": start_seconds,
+                                         "end_seconds": end_seconds, "noise_reduction": noise_reduction,
+                                         "auto_trim": auto_trim},
             }
+            metadata["analysis"]["preprocessing"]["version"] = preprocessing_version
+            if noise_reduction:
+                metadata["analysis"]["preprocessing"]["gain_handling"] = (
+                    "conservative background suppression; no gain normalization"
+                )
             (staged / "metadata.json").write_text(json.dumps(metadata, allow_nan=False, indent=2) + "\n")
             try:
                 staged.rename(directory)

@@ -68,10 +68,11 @@ F5 pretrained weights are licensed CC-BY-NC-4.0; its code is MIT. See the [model
 
 ## Use a voice
 
-1. Record or upload clean single-speaker speech. F5 accepts a complete **1–12 second** recording; aim for **8–12 seconds**. Melo/OpenVoice accepts 1–30 seconds. Native sample rate is preserved.
-2. Save the reference. CPU STT runs by default; review and correct the exact words. F5 requires the matching transcript. Automatic recognition preserves existing manual corrections, including corrections saved while recognition is running.
-3. Choose **Prepare voice for generation** to load models and cache conditioning before timing a request. The first Generate also prepares a voice when needed.
-4. Enter new English text and generate. Each complete phrase plays as it becomes available. With F5, **Reference pace** at 1.0× estimates pace from reference duration and transcript length; it does not reproduce the exact pitch or intonation contour. Stop clears playback and requests cancellation between model calls.
+1. Record or upload clean single-speaker speech up to **30 seconds**. Native sample rate is preserved. Browser microphone capture requests noise suppression and echo cancellation where supported. The saved reference must fit the selected engine: **1–12 seconds** for F5 (aim for **8–12 seconds**), **1–6 seconds** for T-1000, or **1–30 seconds** for Melo/OpenVoice.
+2. Use **Clean up and trim** to choose start/end times, reduce background noise (on by default), or trim quiet edges automatically. Click **Preview changes**, listen, and compare with the original. Keep at least one second of speech and trim to the engine's limit; **Reset edits** restores the full recording and default cleanup settings. Suppression targets steady hiss and hum; competing voices, music and strong room echo may remain.
+3. Save the previewed reference. CPU STT runs by default; review and correct the exact words. F5 and T-1000 require the matching transcript. Automatic recognition preserves existing manual corrections, including corrections saved while recognition is running. Cropping clears draft words so the transcript can match the kept speech. Cleanup runs before analysis, transcription and voice conditioning. **Clean up or trim this voice** edits a saved reference as a new copy, keeping the previous voice and its cached conditioning available.
+4. Choose **Prepare voice for generation** to load models and cache conditioning before timing a request. The first Generate also prepares a voice when needed.
+5. Enter new English text and generate. Each complete phrase plays as it becomes available. With F5, **Reference pace** at 1.0× estimates pace from reference duration and transcript length; it does not reproduce the exact pitch or intonation contour. Stop clears playback and requests cancellation between model calls.
 
 Use **Voice engine** to compare the same recording and words. Installed T-1000 SOAR/MF2 reuse their existing runtime and accept complete 1–6 second references. They preserve native model delivery at 1.0×; the speed slider is disabled rather than applying a pitch or tempo effect. Switching unloads the previous engine before another loads, and is refused during generation. Fitting F5/T-1000 passages keep adjacent sentence context; longer text splits only when the engine budget requires it.
 
@@ -84,12 +85,15 @@ To reuse T-1000's downloaded recognition weights, point `STT_MODEL_DIR` at that 
 ```sh
 .venv/bin/t2000 doctor
 .venv/bin/t2000 enroll /path/to/reference.wav --name 'My voice' --prepare
+.venv/bin/t2000 enroll /path/to/reference.wav --name 'Clean voice' --start-seconds 0.5 --end-seconds 8 --auto-trim
 .venv/bin/t2000 generate --profile PROFILE_ID --text 'Hello, this is a voice test.'
 .venv/bin/python scripts/benchmark.py --reference /path/to/reference.wav \
   --repeats 3 --output-dir data/benchmarks/first-run
 ```
 
 Enrollment prints the profile ID. The benchmark uses [eight English cases](benchmarks/english.json), randomized request order, excluded warmups and separate loading/preparation measurements. It saves JSON, CSV, Markdown, request metadata and WAV paths. Failures remain in failure counts and do not enter successful latency summaries. Repeat `--reference` for more voices. See [the GPU guide](docs/gpu.md) for measurement limits.
+
+CLI and API enrollment enable background suppression by default; CLI `--no-noise-reduction` or API form field `noise_reduction=false` keeps the original sound. `start_seconds`, `end_seconds`, and `auto_trim` are also available as enrollment form fields. `POST /api/reference/preview` accepts the same audio and processing fields and returns a disposable WAV without creating a profile. Programmatic `ProfileStore.create` preserves its original default behavior unless processing options are supplied. References over 30 seconds must be shortened before upload.
 
 ## Configuration
 

@@ -50,6 +50,63 @@ def test_cli_stt_failure_keeps_reference(tmp_path, monkeypatch, capsys):
     assert (tmp_path / "data" / "profiles" / result["id"] / "reference.wav").is_file()
 
 
+@pytest.mark.parametrize("backend,limit", [("f5-tts-v1", 12), ("t1000-soar", 6)])
+def test_cli_enrollment_limits_the_crop_and_keeps_manual_transcript_corrections(
+    tmp_path, monkeypatch, capsys, backend, limit,
+):
+    rate = 16000
+    samples = (0.1 * np.sin(np.arange(rate * 13) * 0.04)).astype(np.float32)
+    reference = tmp_path / "reference.wav"
+    sf.write(reference, samples, rate, subtype="FLOAT")
+    original = reference.read_bytes()
+    captured = []
+
+    def transcribe(path, **kwargs):
+        kept, kept_rate = sf.read(path, dtype="float32")
+        assert kept_rate == rate
+        np.testing.assert_array_equal(kept, samples[rate:rate * (limit + 1)])
+        captured.append(path)
+        return "Automatically recognized kept words"
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", transcribe)
+    monkeypatch.setenv("T2000_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("T2000_BACKEND", backend)
+    arguments = ["t2000", "enroll", str(reference), "--start-seconds", "1",
+                 "--end-seconds", str(limit + 1), "--no-noise-reduction"]
+    monkeypatch.setattr(sys, "argv", arguments)
+    main()
+    profile = json.loads(capsys.readouterr().out)
+    assert profile["duration_seconds"] == limit
+    assert profile["transcript"] == "Automatically recognized kept words"
+    monkeypatch.setattr(sys, "argv", [*arguments, "--transcript", "Manually corrected kept words"])
+    main()
+    corrected = json.loads(capsys.readouterr().out)
+    assert corrected["id"] == profile["id"]
+    assert corrected["transcript"] == "Manually corrected kept words"
+    assert len(captured) == 1
+    assert reference.read_bytes() == original
+    assert len(list((tmp_path / "data" / "profiles").iterdir())) == 1
+
+
+@pytest.mark.parametrize("backend,limit", [("f5-tts-v1", 12), ("t1000-soar", 6)])
+def test_cli_rejects_over_limit_processed_crop_without_artifacts(tmp_path, monkeypatch, capsys, backend, limit):
+    reference = tmp_path / "reference.wav"
+    sf.write(reference, 0.1 * np.sin(np.arange(16000 * 13) * 0.04), 16000)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("An over-limit crop must be rejected before transcription")
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", forbidden)
+    monkeypatch.setenv("T2000_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("T2000_BACKEND", backend)
+    monkeypatch.setattr(sys, "argv", ["t2000", "enroll", str(reference), "--end-seconds", str(limit + 0.5)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 1
+    assert f"{limit} seconds" in capsys.readouterr().err
+    assert list((tmp_path / "data" / "profiles").iterdir()) == []
+
+
 @pytest.mark.parametrize("name,value", [
     ("T2000_REFERENCE_MODE", "unknown"), ("T2000_CONVERSION_TAU", "nan"),
     ("T2000_CONVERSION_TAU", "-0.1"), ("T2000_CONVERSION_TAU", "1.01"),

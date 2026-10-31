@@ -7,7 +7,7 @@ const ENGINE_LABELS = {
   'melo-openvoice-v2': 'Melo/OpenVoice · Fast',
 };
 const state = {
-  profiles: [], selected: null, draft: null, draftUrl: null,
+  profiles: [], selected: null, draft: null, draftUrl: null, previewUrl: null, previewDuration: null, previewValid: false,
   capture: null, capturing: false, saving: false,
   socket: null, generating: false, playback: null, run: null, sttAvailable: null,
   maxReferenceSeconds: 30, recommendedReferenceSeconds: '10–20', runtimeReady: false,
@@ -50,16 +50,18 @@ function lastProfile() {
 
 function updateActions() {
   const selectedTooLong = state.selected?.duration_seconds > state.maxReferenceSeconds;
-  const draftTooLong = state.draft?.duration > state.maxReferenceSeconds;
-  const draftTooShort = Number.isFinite(state.draft?.duration) && state.draft.duration < 1;
+  const previewTooLong = state.previewDuration > state.maxReferenceSeconds;
+  const previewTooShort = !Number.isFinite(state.previewDuration) || state.previewDuration < 1;
   $('generate-button').disabled = state.generating || state.capturing || state.saving || Boolean(state.draft) || !state.selected || selectedTooLong || !textValue().trim();
   $('stop-button').disabled = !(state.generating || (state.playback && !state.playback.drained && !state.playback.cancelled));
-  $('save-reference').disabled = !state.draft || draftTooLong || draftTooShort || state.capturing || state.saving || state.generating;
+  $('save-reference').disabled = !state.draft || !state.previewValid || previewTooLong || previewTooShort || state.capturing || state.saving || state.generating;
   $('save-transcript').disabled = state.generating || state.saving;
   $('prepare-voice').disabled = state.generating || state.saving || state.capturing || selectedTooLong;
   $('profile-select').disabled = state.capturing || state.saving || state.generating;
   $('reference-file').disabled = !state.runtimeReady || state.capturing || state.saving || state.generating;
   $('record-button').disabled = !state.runtimeReady || state.saving || state.generating;
+  $('reference-editor').disabled = state.saving || state.generating || state.capturing;
+  $('edit-reference').disabled = state.saving || state.generating || state.capturing;
   $('voice-engine').disabled = !state.runtimeReady || state.saving || state.generating || state.capturing || state.availableBackends.length < 2;
   for (const id of ['speech-text', 'speech-speed', 'speech-seed', 'reference-transcript', 'voice-name', 'auto-transcribe']) $(id).disabled = state.saving;
   $('speech-speed').disabled = state.saving || !state.speedControlEnabled;
@@ -104,7 +106,7 @@ function applyRuntime(runtime) {
     $('reference-description').textContent = `For voice likeness, start with ${state.recommendedReferenceSeconds} seconds of clean speech. One voice, with as little background noise as possible.`;
     $('help-reference-guidance').textContent = `Record or upload ${state.recommendedReferenceSeconds} seconds of clear, single-speaker speech, up to ${state.maxReferenceSeconds} seconds. Listen back for noise, clipping, and long silences. Shorter clips still work.`;
     if (!state.capturing && !state.draft) $('capture-status').textContent = `Aim for ${state.recommendedReferenceSeconds} seconds of clear speech. Up to ${state.maxReferenceSeconds} seconds.`;
-    referenceGuidance(state.draft ? state.draft.duration : state.selected?.duration_seconds);
+    referenceGuidance(draftReferenceDuration());
     $('engine-name').textContent = ENGINE_LABELS[runtime.backend] || 'Local voice engine';
     $('speech-speed-label').textContent = !speedControlEnabled ? 'Reference delivery' : referenceGuided ? 'Reference pace' : 'Speaking speed';
     $('speech-speed-help').textContent = !speedControlEnabled
@@ -161,9 +163,9 @@ async function switchBackend() {
     });
     applyRuntime(runtime);
     if (!state.draft) await refreshProfiles(selectedId);
-    const tooLong = (state.draft?.duration ?? state.selected?.duration_seconds) > state.maxReferenceSeconds;
+    const tooLong = draftReferenceDuration() > state.maxReferenceSeconds;
     status(tooLong ? `Engine changed. Choose a reference of ${state.maxReferenceSeconds} seconds or less for this engine.`
-      : state.draft ? 'Engine changed. Save this reference to continue.'
+      : state.draft ? state.previewValid ? 'Engine changed. Save this previewed reference to continue.' : 'Engine changed. Preview your edits, then save this reference.'
       : 'Engine changed. Prepare your voice, then compare it with your recording.', tooLong);
   } catch (error) {
     $('voice-engine').value = previous;
@@ -184,6 +186,10 @@ function transcriptStatus(message, error = false) {
   $('transcript-status').classList.toggle('error', error);
 }
 
+function draftReferenceDuration() {
+  return state.draft ? state.previewValid ? state.previewDuration : state.draft.duration : state.selected?.duration_seconds;
+}
+
 function referenceGuidance(duration) {
   const tooShort = Number.isFinite(duration) && duration < 1;
   const tooLong = Number.isFinite(duration) && duration > state.maxReferenceSeconds;
@@ -195,7 +201,7 @@ function referenceGuidance(duration) {
     && (speechSeconds < 2 || (Number.isFinite(delivery?.speech_fraction) && delivery.speech_fraction < 0.6));
   $('reference-guidance').hidden = !(tooShort || tooLong || sparseSpeech || short);
   $('reference-guidance').textContent = tooShort ? 'Record or upload at least one second of clear speech.' : tooLong
-    ? `This reference is ${duration.toFixed(1)} seconds. This voice engine supports complete recordings up to ${state.maxReferenceSeconds} seconds. Record or upload a shorter sample to prepare or generate.`
+    ? `This reference is ${duration.toFixed(1)} seconds. This voice engine supports references up to ${state.maxReferenceSeconds} seconds. ${state.draft ? 'Trim it and preview the kept speech before saving.' : 'Use Clean up or trim this voice to save a shorter copy.'}`
     : sparseSpeech ? `Only about ${speechSeconds.toFixed(1)} seconds of speech were detected. Use a longer, clean recording in the accent and expression you want, and check every transcript word.`
     : short ? `This short reference can be used. For more voice detail, try ${state.recommendedReferenceSeconds} seconds of clean speech.` : '';
 }
@@ -221,12 +227,17 @@ async function refreshProfiles(preferred) {
 
 function clearDraft() {
   if (state.draftUrl) URL.revokeObjectURL(state.draftUrl);
+  if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+  state.previewUrl = null;
+  state.previewValid = false;
+  state.previewDuration = null;
   state.draftUrl = null;
   state.draft = null;
   $('reference-file').value = '';
   $('draft-fields').hidden = true;
   $('transcribe-label').hidden = true;
   $('save-reference').hidden = true;
+  $('compare-reference').hidden = true;
 }
 
 function selectProfile(id) {
@@ -241,6 +252,7 @@ function selectProfile(id) {
   transcriptStatus();
   $('save-transcript').hidden = false;
   $('prepare-voice').hidden = false;
+  $('edit-reference').hidden = false;
   $('reference-player').src = `/api/profiles/${encodeURIComponent(id)}/audio`;
   $('reference-player').hidden = false;
   $('capture-status').textContent = `Record or upload a new sample, up to ${state.maxReferenceSeconds} seconds, to add another voice.`;
@@ -262,6 +274,12 @@ function setDraft(blob, filename, sampleRate, duration) {
   $('reference-player').src = state.draftUrl;
   $('reference-player').hidden = false;
   $('draft-fields').hidden = false;
+  $('edit-reference').hidden = true;
+  $('trim-start').value = '0';
+  $('trim-end').value = '';
+  $('noise-reduction').checked = true;
+  $('auto-trim').checked = false;
+  $('cleanup-status').textContent = 'Preview your changes before saving. You are listening to the original.';
   $('voice-name').value = filename.replace(/\.wav$/i, '') === 'recording' ? 'My voice' : filename.replace(/\.wav$/i, '').slice(0, 80);
   $('reference-transcript').value = '';
   transcriptStatus();
@@ -273,8 +291,82 @@ function setDraft(blob, filename, sampleRate, duration) {
   $('analysis-panel').hidden = true;
   $('capture-status').textContent = sampleRate ? `${duration.toFixed(1)} seconds captured at ${(sampleRate / 1000).toFixed(1)} kHz. Listen, then save your reference.` : `${filename} · Listen, then save your reference.`;
   referenceGuidance(duration);
-  status('Save this reference to use it for generation.');
+  status('Preview your cleanup and trim settings, then save this reference to use it for generation.');
   updateActions();
+}
+
+function processingData() {
+  const data = new FormData();
+  data.append('file', state.draft.blob, state.draft.filename);
+  const start = Number($('trim-start').value);
+  const end = $('trim-end').value.trim() === '' ? null : Number($('trim-end').value);
+  if ($('trim-start').value.trim() === '' || !Number.isFinite(start) || start < 0 ||
+      (end !== null && (!Number.isFinite(end) || end <= start))) {
+    throw new Error('Choose a valid start and end time. Keep at least one second of speech.');
+  }
+  data.append('start_seconds', String(start));
+  if (end !== null) data.append('end_seconds', String(end));
+  data.append('noise_reduction', String($('noise-reduction').checked));
+  data.append('auto_trim', String($('auto-trim').checked));
+  return data;
+}
+
+function invalidatePreview(clearTranscript = false) {
+  if (!state.draft) return;
+  state.previewValid = false;
+  state.previewDuration = null;
+  if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+  state.previewUrl = null;
+  $('compare-reference').hidden = true;
+  $('reference-player').src = state.draftUrl;
+  $('cleanup-status').textContent = 'Changes need a new preview before saving. You are listening to the original.';
+  if (clearTranscript) $('reference-transcript').value = '';
+  referenceGuidance(state.draft.duration);
+  updateActions();
+}
+
+async function previewReference() {
+  if (!state.draft || state.saving || state.capturing || state.generating) return;
+  state.saving = true; updateActions();
+  $('cleanup-status').textContent = 'Preparing your preview…';
+  try {
+    const response = await fetch('/api/reference/preview', { method: 'POST', body: processingData() });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(typeof body.detail === 'string' ? body.detail : 'The reference could not be processed. Check your crop times.');
+    }
+    const duration = Number(response.headers.get('X-Reference-Duration'));
+    if (!Number.isFinite(duration) || duration < 1) throw new Error('The preview did not contain at least one second of audio.');
+    const blob = await response.blob();
+    if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+    state.previewUrl = URL.createObjectURL(blob);
+    state.previewValid = true;
+    state.previewDuration = duration;
+    $('reference-player').src = state.previewUrl;
+    $('compare-reference').hidden = false;
+    $('compare-reference').textContent = 'Listen to original';
+    referenceGuidance(duration);
+    $('cleanup-status').textContent = `Preview ready${Number.isFinite(duration) && duration > 0 ? ` · ${duration.toFixed(2)} seconds` : ''}. Listen and check that the transcript matches the kept words, then save.`;
+    status(duration > state.maxReferenceSeconds ? `Preview is ${duration.toFixed(2)} seconds. Trim it to ${state.maxReferenceSeconds} seconds or less for this engine, then preview again.` : 'Preview ready. Save this reference when it sounds right.', duration > state.maxReferenceSeconds);
+  } catch (error) {
+    invalidatePreview();
+    $('cleanup-status').textContent = explain(error);
+    status(explain(error), true);
+  } finally { state.saving = false; updateActions(); }
+}
+
+async function editReference() {
+  if (!state.selected || state.saving || state.generating || state.capturing) return;
+  const selected = state.selected;
+  state.saving = true; updateActions();
+  try {
+    const response = await fetch(`/api/profiles/${encodeURIComponent(selected.id)}/audio`);
+    if (!response.ok) throw new Error('The saved recording is unavailable. Upload or record it again.');
+    setDraft(await response.blob(), `${selected.name}.wav`, selected.sample_rate, selected.duration_seconds);
+    $('voice-name').value = `${selected.name} edited`.slice(0, 80);
+    status('Edit this copy, then preview and save. Your saved voice remains available.');
+  } catch (error) { status(explain(error), true); }
+  finally { state.saving = false; updateActions(); }
 }
 
 function floatWave(chunks, frames, sampleRate) {
@@ -300,7 +392,7 @@ async function startCapture() {
   let context, stream;
   try {
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) throw new Error('Microphone recording requires a browser with AudioWorklet on localhost or HTTPS.');
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 } });
     context = new AudioContext(); // Preserve the device/context native sample rate.
     await context.audioWorklet.addModule('/static/playback-worklet.js');
     await context.resume();
@@ -388,17 +480,16 @@ function stopCapture() {
 }
 
 async function saveReference() {
-  if (!state.draft || state.saving || state.capturing) return;
-  if (Number.isFinite(state.draft.duration) && state.draft.duration < 1) { status('Use a reference of at least one second.', true); return; }
-  if (state.draft.duration > state.maxReferenceSeconds) { status(`Use a complete reference of ${state.maxReferenceSeconds} seconds or less.`, true); return; }
+  if (!state.draft || !state.previewValid || state.saving || state.capturing || state.generating) return;
+  if (!Number.isFinite(state.previewDuration) || state.previewDuration < 1) { status('Preview at least one second of speech before saving.', true); return; }
+  if (state.previewDuration > state.maxReferenceSeconds) { status(`Trim the reference to ${state.maxReferenceSeconds} seconds or less, then preview again.`, true); return; }
   state.saving = true; updateActions();
   const transcribing = $('auto-transcribe').checked && !$('reference-transcript').value.trim();
   status(transcribing ? 'Saving and transcribing the reference…' : 'Analyzing and saving the reference…');
   transcriptStatus(transcribing ? 'Transcribing your recording. Review the words when it is saved…' : 'Saving your reference and transcript…');
   $('save-reference').textContent = transcribing ? 'Saving and transcribing…' : 'Saving reference…';
   try {
-    const data = new FormData();
-    data.append('file', state.draft.blob, state.draft.filename);
+    const data = processingData();
     data.append('name', $('voice-name').value.trim() || 'My voice');
     data.append('transcript', $('reference-transcript').value.trim());
     data.append('transcribe', String($('auto-transcribe').checked));
@@ -671,19 +762,34 @@ $('record-button').addEventListener('click', () => state.capturing ? stopCapture
 $('reference-file').addEventListener('change', () => {
   const file = $('reference-file').files[0];
   if (!file) return;
-  if (file.size > 16 * 1024 * 1024) { status(`Use a WAV reference smaller than 16 MB and no longer than ${state.maxReferenceSeconds} seconds.`, true); return; }
+  if (file.size > 16 * 1024 * 1024) { status('Use a WAV reference smaller than 16 MB and no longer than 30 seconds. Trim the kept speech to fit your voice engine.', true); return; }
   if (!/\.wav$/i.test(file.name)) { status('Upload a WAV recording.', true); return; }
   setDraft(file, file.name);
 });
 $('reference-player').addEventListener('loadedmetadata', () => {
   if (!state.draft || $('reference-player').src !== state.draftUrl || !Number.isFinite($('reference-player').duration)) return;
   state.draft.duration = $('reference-player').duration;
-  referenceGuidance(state.draft.duration);
+  referenceGuidance(draftReferenceDuration());
   updateActions();
 });
 $('profile-select').addEventListener('change', () => selectProfile($('profile-select').value));
 $('voice-engine').addEventListener('change', () => void switchBackend());
 $('save-reference').addEventListener('click', () => void saveReference());
+$('preview-reference').addEventListener('click', () => void previewReference());
+$('edit-reference').addEventListener('click', () => void editReference());
+for (const id of ['trim-start', 'trim-end', 'auto-trim', 'noise-reduction']) {
+  $(id).addEventListener('input', () => invalidatePreview(id !== 'noise-reduction'));
+}
+$('reset-reference').addEventListener('click', () => {
+  $('trim-start').value = '0'; $('trim-end').value = '';
+  $('noise-reduction').checked = true; $('auto-trim').checked = false;
+  invalidatePreview(true);
+});
+$('compare-reference').addEventListener('click', () => {
+  const original = $('reference-player').src === state.draftUrl;
+  $('reference-player').src = original ? state.previewUrl : state.draftUrl;
+  $('compare-reference').textContent = original ? 'Listen to original' : 'Listen to edited preview';
+});
 $('save-transcript').addEventListener('click', () => void saveTranscript());
 $('prepare-voice').addEventListener('click', () => void prepareVoice());
 $('generate-button').addEventListener('click', () => void generate());

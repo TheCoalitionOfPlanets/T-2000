@@ -1,4 +1,5 @@
 import io
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -176,3 +177,133 @@ def test_backend_switch_rejects_unavailable_or_busy_engine(client, monkeypatch):
     finally:
         engine._lock.release()
     assert client.post("/api/backend", json={"backend": "not-an-engine"}).status_code == 422
+
+
+def crop_reference_bytes():
+    rate = 48000
+    samples = np.zeros(rate * 4, dtype=np.float32)
+    samples[rate:rate * 3] = 0.2 * np.sin(2 * np.pi * 220 * np.arange(rate * 2) / rate)
+    out = io.BytesIO()
+    sf.write(out, samples, rate, format="WAV", subtype="FLOAT")
+    return out.getvalue()
+
+
+def test_preview_and_saved_reference_are_identical_and_original_stays_immutable(client):
+    source = crop_reference_bytes()
+    original = client.post("/api/profiles", files={"file": ("original.wav", source)},
+                           data={"name": "Original", "noise_reduction": "false"}).json()
+    original_audio = client.get(f"/api/profiles/{original['id']}/audio").content
+    options = {"start_seconds": "1", "end_seconds": "3", "noise_reduction": "true"}
+    preview = client.post("/api/reference/preview", files={"file": ("source.wav", source)}, data=options)
+    assert preview.status_code == 200, preview.text
+    assert preview.headers["cache-control"] == "no-store"
+    assert float(preview.headers["x-reference-duration"]) == 2
+    assert len(client.get("/api/profiles").json()) == 1, "preview must not save a profile"
+    saved = client.post("/api/profiles", files={"file": ("source.wav", source)},
+                        data=dict(options, name="Edited")).json()
+    assert saved["id"] != original["id"]
+    assert saved["sample_rate"] == 48000
+    assert saved["duration_seconds"] == 2
+    assert saved["analysis"]["duration_seconds"] == 2
+    assert saved["reference_processing"]["start_seconds"] == 1
+    saved_audio = client.get(f"/api/profiles/{saved['id']}/audio").content
+    assert saved_audio == preview.content
+    assert client.get(f"/api/profiles/{original['id']}/audio").content == original_audio
+    assert list((client.app.state.engine.settings.data_dir / ".uploads").iterdir()) == []
+
+
+@pytest.mark.parametrize("options", [
+    {"start_seconds": "3", "end_seconds": "2"}, {"start_seconds": "-1"},
+    {"end_seconds": "5"}, {"start_seconds": "nan"}, {"end_seconds": "inf"},
+    {"start_seconds": "1", "end_seconds": "1.5"}, {"start_seconds": "0", "end_seconds": "1"},
+])
+def test_invalid_crop_rejected_by_preview_and_save_without_artifacts(client, options):
+    for endpoint in ("/api/reference/preview", "/api/profiles"):
+        response = client.post(endpoint, files={"file": ("source.wav", crop_reference_bytes())}, data=options)
+        assert response.status_code in (400, 422), response.text
+    assert client.get("/api/profiles").json() == []
+    assert list((client.app.state.engine.settings.data_dir / ".uploads").iterdir()) == []
+
+
+def test_transcription_receives_the_processed_crop(client):
+    captured = []
+
+    def recognize(path, **kwargs):
+        samples, rate = sf.read(path)
+        captured.append((len(samples), rate))
+        return "The kept words."
+
+    with patch("t2000.stt.transcribe_file", side_effect=recognize):
+        response = client.post("/api/profiles", files={"file": ("source.wav", crop_reference_bytes())},
+                               data={"start_seconds": "1", "end_seconds": "3", "transcribe": "true"})
+    assert response.status_code == 201, response.text
+    assert response.json()["transcript"] == "The kept words."
+    assert captured == [(96000, 48000)]
+
+
+def test_noise_cleanup_is_default_for_api_enrollment(client):
+    profile = enroll(client)
+    assert profile["reference_processing"]["noise_reduction"] is True
+    assert profile["preprocessing_version"].endswith("cleanup-v1")
+
+
+@pytest.mark.parametrize("backend,limit", [("f5-tts-v1", 12), ("t1000-soar", 6)])
+def test_backend_limit_applies_to_kept_audio_and_cropped_transcripts_can_be_corrected(
+    tmp_path, monkeypatch, backend, limit,
+):
+    rate = 16000
+    samples = (0.1 * np.sin(np.arange(rate * 13) * 0.04)).astype(np.float32)
+    source = io.BytesIO()
+    sf.write(source, samples, rate, format="WAV", subtype="FLOAT")
+    captured = []
+
+    def transcribe(path, **kwargs):
+        kept, kept_rate = sf.read(path, dtype="float32")
+        assert kept_rate == rate
+        np.testing.assert_array_equal(kept, samples[rate:rate * (limit + 1)])
+        captured.append(path)
+        return "Automatically recognized kept words"
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", transcribe)
+    app = create_app(Settings(data_dir=tmp_path, backend=backend), FakeBackend())
+    options = {"start_seconds": "1", "end_seconds": str(limit + 1), "noise_reduction": "false"}
+    with TestClient(app) as direct_client:
+        response = direct_client.post("/api/profiles", files={"file": ("long.wav", source.getvalue())},
+                                      data=options)
+        assert response.status_code == 201, response.text
+        profile = response.json()
+        assert profile["duration_seconds"] == limit
+        assert profile["transcript"] == "Automatically recognized kept words"
+        corrected = direct_client.post("/api/profiles", files={"file": ("long.wav", source.getvalue())},
+                                       data=dict(options, transcript="Manually corrected kept words"))
+        assert corrected.status_code == 201, corrected.text
+        assert corrected.json()["id"] == profile["id"]
+        assert corrected.json()["transcript"] == "Manually corrected kept words"
+        assert len(captured) == 1
+        assert len(direct_client.get("/api/profiles").json()) == 1
+        assert list((tmp_path / ".uploads").iterdir()) == []
+
+
+@pytest.mark.parametrize("backend,limit", [("f5-tts-v1", 12), ("t1000-soar", 6)])
+def test_over_limit_crop_can_be_previewed_but_cannot_create_profile(tmp_path, monkeypatch, backend, limit):
+    source = io.BytesIO()
+    sf.write(source, 0.1 * np.sin(np.arange(16000 * 13) * 0.04), 16000, format="WAV")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("An over-limit crop must be rejected before transcription")
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", forbidden)
+    app = create_app(Settings(data_dir=tmp_path, backend=backend), FakeBackend())
+    options = {"end_seconds": str(limit + 0.5), "noise_reduction": "false"}
+    with TestClient(app) as direct_client:
+        preview = direct_client.post("/api/reference/preview", files={"file": ("long.wav", source.getvalue())},
+                                     data=options)
+        assert preview.status_code == 200, preview.text
+        assert float(preview.headers["x-reference-duration"]) == limit + 0.5
+        response = direct_client.post("/api/profiles", files={"file": ("long.wav", source.getvalue())},
+                                      data=options)
+        assert response.status_code == 400, response.text
+        assert f"{limit} seconds" in response.json()["detail"]
+        assert direct_client.get("/api/profiles").json() == []
+        assert list((tmp_path / "profiles").iterdir()) == []
+        assert list((tmp_path / ".uploads").iterdir()) == []

@@ -99,8 +99,22 @@ if (process.env.T2000_BROWSER_URL) {
       await page.locator('#reference-file').setInputFiles({ name: 'browser-check.wav', mimeType: 'audio/wav', buffer: wav });
       await page.locator('#auto-transcribe').uncheck(); // Transport test signals contain no speech.
       await page.locator('#voice-name').fill('Browser transport check');
+      assert.equal(await page.locator('#noise-reduction').isChecked(), true);
+      assert.equal(await page.locator('#save-reference').isDisabled(), true, 'unreviewed edits must be previewed');
+      await page.locator('#reference-transcript').fill('Words before cropping');
+      await page.locator('#trim-start').fill('0.25');
+      await page.locator('#trim-end').fill('1.75');
+      assert.equal(await page.locator('#reference-transcript').inputValue(), '', 'crop changes clear stale words');
+      await page.locator('#preview-reference').click();
+      await page.locator('#cleanup-status').filter({ hasText: 'Preview ready' }).waitFor();
+      const previewSource = await page.locator('#reference-player').getAttribute('src');
+      await page.locator('#compare-reference').click();
+      assert.notEqual(await page.locator('#reference-player').getAttribute('src'), previewSource);
+      await page.locator('#compare-reference').click();
+      assert.equal(await page.locator('#reference-player').getAttribute('src'), previewSource);
       await page.locator('#save-reference').click();
       await page.locator('#session-status').filter({ hasText: 'Reference saved.' }).waitFor();
+      assert.match(await page.locator('#reference-summary').textContent(), /1\.5 seconds/);
       assert.equal(await page.locator('#analysis-panel').isVisible(), true);
       assert.equal(await page.locator('#reference-guidance').isVisible(), true, 'short references get guidance while remaining usable');
       await page.locator('#reference-transcript').fill('Reference for transport checks.');
@@ -126,7 +140,11 @@ if (process.env.T2000_BROWSER_URL) {
       await page.locator('#record-button').click();
       await page.locator('#capture-status').filter({ hasText: 'seconds captured at' }).waitFor();
       assert.equal(await page.locator('#generate-button').isDisabled(), true, 'unsaved references must not generate using an old voice');
-      console.log('Browser integration passed: WAV enrollment, graphs, transcript edit, preparation, streaming playback, audible timing, download, mobile layout, microphone finalization, and draft isolation. Test-double timings are not inference benchmarks.');
+      await page.locator('#reset-reference').click();
+      assert.equal(await page.locator('#trim-start').inputValue(), '0');
+      assert.equal(await page.locator('#trim-end').inputValue(), '');
+      assert.equal(await page.locator('#save-reference').isDisabled(), true);
+      console.log('Browser integration passed: cleanup/crop preview and comparison, immutable WAV enrollment, graphs, transcript edit, preparation, streaming playback, audible timing, download, mobile layout, microphone finalization, and draft isolation. Test-double timings are not inference benchmarks.');
     }
     assert.equal(errors.length, 0, errors.join('\n'));
     console.log('Browser studio loaded without JavaScript errors.');
@@ -241,5 +259,68 @@ if (process.env.T2000_BROWSER_URL) {
     assert.deepEqual(engineErrors, []);
     await enginePage.close();
     console.log('Browser engine switch passed: availability, saved transcript ordering, pending-operation lock, reference limits, selected voice preservation, server rejection recovery, and mobile layout.');
+
+    if (process.env.T2000_BROWSER_INTEGRATION === '1') {
+      const cropPage = await browser.newPage();
+      const cropErrors = [];
+      cropPage.on('pageerror', (error) => cropErrors.push(error.message));
+      currentEngine = 'f5-tts-v1';
+      await cropPage.route('**/api/status', (route) => route.fulfill({ json: runtime() }));
+      await cropPage.route('**/api/backend', (route) => {
+        currentEngine = route.request().postDataJSON().backend;
+        return route.fulfill({ json: runtime() });
+      });
+      await cropPage.goto(process.env.T2000_BROWSER_URL);
+      await cropPage.waitForFunction(() => document.getElementById('voice-engine').value === 'f5-tts-v1');
+      const rate = 16000, frames = rate * 13;
+      const wav = Buffer.alloc(44 + frames * 4);
+      wav.write('RIFF', 0); wav.writeUInt32LE(36 + frames * 4, 4); wav.write('WAVEfmt ', 8);
+      wav.writeUInt32LE(16, 16); wav.writeUInt16LE(3, 20); wav.writeUInt16LE(1, 22);
+      wav.writeUInt32LE(rate, 24); wav.writeUInt32LE(rate * 4, 28);
+      wav.writeUInt16LE(4, 32); wav.writeUInt16LE(32, 34); wav.write('data', 36);
+      wav.writeUInt32LE(frames * 4, 40);
+      for (let i = 0; i < frames; i++) wav.writeFloatLE(0.18 * Math.sin(2 * Math.PI * 197 * i / rate), 44 + i * 4);
+      await cropPage.locator('#reference-file').setInputFiles({ name: 'long-crop-check.wav', mimeType: 'audio/wav', buffer: wav });
+      await cropPage.locator('#auto-transcribe').uncheck();
+      await cropPage.locator('#preview-reference').click();
+      await cropPage.locator('#cleanup-status').filter({ hasText: 'Preview ready' }).waitFor();
+      assert.equal(await cropPage.locator('#save-reference').isDisabled(), true, 'an over-cap preview cannot save');
+      await cropPage.locator('#trim-start').fill('1');
+      await cropPage.locator('#trim-end').fill('12');
+      await cropPage.locator('#preview-reference').click();
+      await cropPage.locator('#cleanup-status').filter({ hasText: '11.00 seconds' }).waitFor();
+      assert.equal(await cropPage.locator('#save-reference').isEnabled(), true, 'a valid crop can save despite an over-cap original');
+      await cropPage.locator('#voice-engine').selectOption('t1000-soar');
+      await cropPage.locator('#session-status').filter({ hasText: 'Engine changed. Choose a reference of 6 seconds or less' }).waitFor();
+      assert.equal(await cropPage.locator('#save-reference').isDisabled(), true, 'switching engines rechecks the processed duration');
+      await cropPage.locator('#trim-end').fill('6');
+      assert.equal(await cropPage.locator('#save-reference').isDisabled(), true, 'crop changes invalidate the previous preview');
+      await cropPage.locator('#preview-reference').click();
+      await cropPage.locator('#cleanup-status').filter({ hasText: '5.00 seconds' }).waitFor();
+      await cropPage.locator('#compare-reference').click();
+      await cropPage.waitForFunction(() => document.getElementById('reference-player').duration === 13);
+      assert.equal(await cropPage.locator('#save-reference').isEnabled(), true, 'original comparison metadata preserves the valid processed duration');
+      await cropPage.locator('#reference-transcript').fill('Checked words in the kept recording.');
+      await cropPage.locator('#save-reference').click();
+      await cropPage.locator('#session-status').filter({ hasText: 'Reference saved.' }).waitFor();
+      assert.match(await cropPage.locator('#reference-summary').textContent(), /5.0 seconds/);
+      const savedId = await cropPage.locator('#profile-select').inputValue();
+      const savedAudio = await (await cropPage.request.get(`${process.env.T2000_BROWSER_URL}/api/profiles/${savedId}/audio`)).body();
+      await cropPage.locator('#edit-reference').click();
+      await cropPage.locator('#session-status').filter({ hasText: 'Edit this copy' }).waitFor();
+      await cropPage.locator('#trim-start').fill('0.5');
+      await cropPage.locator('#trim-end').fill('4.5');
+      await cropPage.locator('#preview-reference').click();
+      await cropPage.locator('#cleanup-status').filter({ hasText: '4.00 seconds' }).waitFor();
+      await cropPage.locator('#save-reference').click();
+      await cropPage.locator('#session-status').filter({ hasText: 'Reference saved.' }).waitFor();
+      assert.notEqual(await cropPage.locator('#profile-select').inputValue(), savedId, 'editing a saved voice creates a new profile');
+      assert.deepEqual(await (await cropPage.request.get(`${process.env.T2000_BROWSER_URL}/api/profiles/${savedId}/audio`)).body(), savedAudio, 'the previous saved recording remains unchanged');
+      await cropPage.setViewportSize({ width: 390, height: 844 });
+      assert.equal(await cropPage.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+      assert.deepEqual(cropErrors, []);
+      await cropPage.close();
+      console.log('Browser crop/engine integration passed: processed duration limits, engine changes, original comparison metadata, and immutable saved-voice editing.');
+    }
   } finally { await browser.close(); }
 }

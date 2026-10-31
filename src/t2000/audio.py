@@ -60,6 +60,22 @@ def load_audio(path: Path, max_seconds: float = 30, min_seconds: float = 1) -> A
     return Audio(np.ascontiguousarray(mono), int(rate))
 
 
+def prepare_reference(path: Path, *, start_seconds: float = 0, end_seconds: float | None = None,
+                      noise_reduction: bool = False, auto_trim: bool = False) -> Audio:
+    """Prepare the exact reference used by preview, analysis, STT and conditioning."""
+    from .reference_processing import process_reference
+
+    audio = load_audio(path)
+    try:
+        samples = process_reference(
+            audio.samples, audio.sample_rate, start_seconds=start_seconds, end_seconds=end_seconds,
+            noise_reduction=noise_reduction, auto_trim=auto_trim,
+        )
+    except ValueError as exc:
+        raise T2000Error(str(exc)) from exc
+    return Audio(samples, audio.sample_rate)
+
+
 def _waveform(samples: np.ndarray, rate: int) -> dict:
     # Min/max pairs retain peaks that point sampling can miss.
     boundaries = np.linspace(0, len(samples), min(300, len(samples)) + 1, dtype=int)

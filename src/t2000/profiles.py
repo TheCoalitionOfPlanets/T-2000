@@ -1,6 +1,7 @@
 """Content-addressed reference artifacts and versioned conditioning cache paths."""
 
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -33,12 +34,16 @@ class ProfileStore:
         return directory
 
     def create(self, source_path: Path, name: str, transcript: str = "", *, start_seconds: float = 0,
-               end_seconds: float | None = None, noise_reduction: bool = False, auto_trim: bool = False) -> dict:
+               end_seconds: float | None = None, noise_reduction: bool = False, auto_trim: bool = False,
+               max_seconds: float = 30) -> dict:
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 120:
             raise T2000Error("Use a reference name between 1 and 120 characters.")
         transcript = self._transcript(transcript)
         audio = prepare_reference(source_path, start_seconds=start_seconds, end_seconds=end_seconds,
                                   noise_reduction=noise_reduction, auto_trim=auto_trim)
+        # Engine limits apply to the kept speech, before creating any profile artifacts.
+        if audio.duration_seconds > max_seconds:
+            raise T2000Error(f"Use a reference of {max_seconds:g} seconds or less after cleanup and trimming.")
         processed = noise_reduction or auto_trim or start_seconds != 0 or end_seconds is not None
         preprocessing_version = PREPROCESSING_VERSION + ("-cleanup-v1" if processed else "")
         digest = hashlib.sha256()
@@ -118,12 +123,14 @@ class ProfileStore:
         self.get(profile_id)
         return self._directory(profile_id) / "reference.wav"
 
-    def conditioning_dir(self, profile_id: str, backend_signature: str | dict) -> Path:
+    def conditioning_dir(self, profile_id: str, backend_signature: str | dict,
+                         *, transcript: str | None = None) -> Path:
         metadata = self.get(profile_id)
         try:
             key = hashlib.sha256(json.dumps({
                 "schema_version": SCHEMA_VERSION, "preprocessing_version": metadata["preprocessing_version"],
-                "audio_sha256": metadata["audio_sha256"], "transcript": metadata["transcript"],
+                "audio_sha256": metadata["audio_sha256"],
+                "transcript": metadata["transcript"] if transcript is None else self._transcript(transcript),
                 "backend_signature": backend_signature,
             }, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         except (ValueError, TypeError) as exc:
@@ -132,15 +139,30 @@ class ProfileStore:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
-    def update_transcript(self, profile_id: str, text: str) -> dict:
-        metadata = self.get(profile_id)
-        metadata["transcript"] = self._transcript(text)
+    def update_transcript(self, profile_id: str, text: str, *, only_if_empty: bool = False) -> dict:
+        """Serialize metadata updates; late ASR must not replace a user's correction."""
+        transcript = self._transcript(text)
         directory = self._directory(profile_id)
-        fd, temporary = tempfile.mkstemp(prefix=".metadata-", suffix=".json", dir=directory)
+        # A directory lock avoids a lock-file symlink and works across store instances,
+        # threads and CLI/server processes. Read the current metadata only after locking.
         try:
-            with os.fdopen(fd, "w") as output:
-                output.write(json.dumps(metadata, allow_nan=False, indent=2) + "\n")
-            Path(temporary).replace(directory / "metadata.json")
+            guard = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise T2000Error("This reference profile is unavailable. Enroll a recording first.") from exc
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            metadata = self.get(profile_id)
+            if only_if_empty and metadata["transcript"]:
+                return metadata
+            metadata["transcript"] = transcript
+            fd, temporary = tempfile.mkstemp(prefix=".metadata-", suffix=".json", dir=directory)
+            try:
+                with os.fdopen(fd, "w") as output:
+                    output.write(json.dumps(metadata, allow_nan=False, indent=2) + "\n")
+                Path(temporary).replace(directory / "metadata.json")
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+            return metadata
         finally:
-            Path(temporary).unlink(missing_ok=True)
-        return metadata
+            fcntl.flock(guard, fcntl.LOCK_UN)
+            os.close(guard)

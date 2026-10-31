@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "instrument sans",
+        "createdAt": "2026-10-30T05:03:38.997Z",
+        "reason": "Agent: retained Instrument Sans to match the user-requested T-1000 UI; the source T-1000 stylesheet uses this font for its regular face, bold face, and root typography."
+      }
+    ]
+  }
+}

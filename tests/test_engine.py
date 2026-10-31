@@ -1,6 +1,7 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -21,6 +22,8 @@ class FakeBackend:
         self.active = 0
         self.max_active = 0
         self.prepared = []
+        self.reference_texts = []
+        self.texts = []
 
     def load(self):
         if self.fail:
@@ -29,10 +32,12 @@ class FakeBackend:
     def signature(self):
         return "test-backend-v1"
 
-    def prepare(self, reference_path, cache_dir):
+    def prepare(self, reference_path, cache_dir, *, reference_text=""):
         self.prepared.append(cache_dir)
+        self.reference_texts.append(reference_text)
 
     def synthesize(self, text, cache_dir, *, speed, seed):
+        self.texts.append(text)
         self.active += 1
         self.max_active = max(self.active, self.max_active)
         time.sleep(0.005)
@@ -53,6 +58,65 @@ def setup_engine(tmp_path):
     backend = FakeBackend()
     settings = Settings(data_dir=tmp_path)
     return Engine(settings, store, backend), profile, backend
+
+
+def test_transcript_conditioned_backend_fills_missing_reference_words_once(setup_engine, monkeypatch):
+    engine, profile, backend = setup_engine
+    backend.requires_reference_text = True
+    calls = []
+
+    def transcribe(*args, **kwargs):
+        calls.append(args)
+        return "The exact reference words"
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", transcribe)
+    engine.prepare_profile(profile["id"])
+    assert engine.store.get(profile["id"])["transcript"] == "The exact reference words"
+    assert backend.reference_texts[-1] == "The exact reference words"
+    engine.prepare_profile(profile["id"])
+    assert len(calls) == 1
+
+
+def test_transcript_conditioned_backend_keeps_corrected_reference_words(setup_engine, monkeypatch):
+    engine, profile, backend = setup_engine
+    backend.requires_reference_text = True
+    engine.store.update_transcript(profile["id"], "Manually checked words")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A reviewed transcript must not be overwritten")
+
+    monkeypatch.setattr("t2000.stt.transcribe_file", forbidden)
+    engine.prepare_profile(profile["id"])
+    assert backend.reference_texts[-1] == "Manually checked words"
+
+
+def test_correction_during_model_loading_uses_consistent_conditioning_snapshot(setup_engine, monkeypatch):
+    engine, profile, backend = setup_engine
+    engine.store.update_transcript(profile["id"], "Before loading")
+
+    def load():
+        engine.store.update_transcript(profile["id"], "Corrected while loading")
+
+    monkeypatch.setattr(backend, "load", load)
+    engine.prepare_profile(profile["id"])
+    assert backend.reference_texts[-1] == "Corrected while loading"
+    assert backend.prepared[-1] == engine.store.conditioning_dir(profile["id"], backend.signature())
+
+
+def test_direct_backend_keeps_connected_sentence_context_and_source_whitespace(setup_engine):
+    import json
+
+    engine, profile, backend = setup_engine
+    engine.settings = replace(engine.settings, backend="f5-tts-v1")
+    engine.store.update_transcript(profile["id"], "These are the complete words in the reference recording.")
+    text = "I thought you would understand.\n\nCould we talk about it, please?"
+    result = engine.generate(profile["id"], text)
+    assert backend.texts == [text]
+    assert result["metrics"]["phrases"] == 1
+    assert result["metrics"]["planning_seconds"] >= 0
+    report = json.loads((engine.settings.data_dir / "output" / f"{result['job_id']}.json").read_text())
+    assert report["delivery_plan"]["source_text"] == text
+    assert report["delivery_plan"]["segments"][0]["reason"] == "complete_context_fits"
 
 
 def test_complete_output_matches_stream_and_is_published_atomically(setup_engine):

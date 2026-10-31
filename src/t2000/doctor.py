@@ -11,6 +11,8 @@ def inspect_runtime(settings: Settings) -> dict:
         "python": platform.python_version(), "platform": platform.platform(),
         "model_dir": str(settings.model_dir), "manifest_present": (settings.model_dir / "manifest.json").is_file(),
         "tts_device": settings.tts_device, "converter_device": settings.converter_device,
+        "reference_mode": settings.reference_mode, "conversion_tau": settings.conversion_tau,
+        "backend": settings.backend, "f5_python": str(settings.f5_python), "f5_steps": settings.f5_steps,
         "dependencies": {name: importlib.util.find_spec(name) is not None
                          for name in ("torch", "torchaudio", "sherpa_onnx", "transformers", "soundfile")},
         "stt_models_present": all((settings.stt_model_dir / name).is_file()

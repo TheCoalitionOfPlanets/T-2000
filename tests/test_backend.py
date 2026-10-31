@@ -51,6 +51,9 @@ class Tensor:
     def float(self):
         return self
 
+    def mean(self, axis):
+        return Tensor(self.values.mean(axis=axis))
+
     def numpy(self):
         return self.values
 
@@ -66,6 +69,7 @@ class TorchBoundary:
     inference_mode = staticmethod(nullcontext)
     is_tensor = staticmethod(lambda value: isinstance(value, Tensor))
     isfinite = staticmethod(lambda value: np.isfinite(value.values))
+    stack = staticmethod(lambda values: Tensor(np.stack([value.values for value in values])))
 
     def manual_seed(self, seed):
         self.seeds.append(seed)
@@ -164,6 +168,114 @@ def test_changed_reference_recomputes_conditioning(backend):
     sf.write(reference, np.full(48000, 0.5, dtype=np.float32), 48000, subtype="FLOAT")
     model.prepare(reference, cache)
     assert calls.reference == 2
+
+
+def test_conversion_tau_is_explicit_and_changes_conditioning_signature(backend):
+    model, calls, _, reference, cache = backend
+    default = model.signature()
+    model.tau = 0.1
+    assert model.signature() != default
+    model.prepare(reference, cache)
+    model.synthesize("A controlled conversion candidate.", cache, speed=1, seed=42)
+    assert calls.conversion[0][2]["tau"] == 0.1
+
+
+@pytest.mark.parametrize("kwargs", [{"reference_mode": "unknown"}, {"tau": float("nan")},
+                                   {"tau": -0.1}, {"tau": 1.1}, {"tau": True}])
+def test_invalid_reference_candidate_settings_are_rejected(tmp_path, kwargs):
+    with pytest.raises(T2000Error, match="Reference mode|tau"):
+        MeloOpenVoiceBackend(tmp_path, **kwargs)
+
+
+def speech_mode(model, monkeypatch, tmp_path):
+    model.reference_mode = "speech"
+    vad_path = tmp_path / "pinned-vad.onnx"
+    vad_path.write_bytes(b"the VAD verifier boundary")
+    monkeypatch.setattr(model, "_vad_path", lambda: vad_path)
+    return vad_path
+
+
+def test_speech_reference_averages_chunk_embeddings_and_preserves_recording(backend, monkeypatch, tmp_path):
+    model, calls, torch, reference, cache = backend
+    vad_path = speech_mode(model, monkeypatch, tmp_path)
+    sf.write(reference, np.full(26 * 22050, 0.2, dtype=np.float32), 22050, subtype="FLOAT")
+    original = reference.read_bytes()
+    monkeypatch.setattr(model, "_speech_regions", lambda samples: [(0, len(samples))])
+    signature = model.signature()
+    model.prepare(reference, cache)
+    assert calls.reference == 3
+    assert max(values.shape[-1] for values in calls.spec_samples) <= 10 * 22050
+    saved = torch.load(cache / "target.pt", map_location="cpu", weights_only=True)
+    np.testing.assert_allclose(saved["embedding"].values, 2)
+    assert saved["conditioning"]["segments"] == 3
+    assert saved["conditioning"]["conditioning_seconds"] == 26
+    assert reference.read_bytes() == original
+    model.prepare(reference, cache)
+    assert calls.reference == 3  # Complete speech-only conditioning is reused.
+    vad_path.write_bytes(b"changed detector")
+    assert model.signature() != signature
+
+
+def test_short_speech_reference_is_one_segment_and_no_speech_is_actionable(backend, monkeypatch, tmp_path):
+    model, calls, _, reference, cache = backend
+    speech_mode(model, monkeypatch, tmp_path)
+    model._sample_rate = 22050
+    monkeypatch.setattr(model, "_speech_regions", lambda samples: [(0, len(samples))])
+    samples = np.full(round(3.904 * 22050), 0.2, dtype=np.float32)
+    segments, info = model._reference_segments(samples)
+    assert len(segments) == 1 and info["segments"] == 1
+    np.testing.assert_array_equal(segments[0], samples)
+    monkeypatch.setattr(model, "_speech_regions", lambda samples: [])
+    with pytest.raises(T2000Error, match="No speech was detected"):
+        model.prepare(reference, cache)
+    assert calls.reference == 0 and not (cache / "target.pt").exists()
+
+
+def test_vad_flush_maps_padded_regions_to_original_rate_and_merges_overlap(backend, monkeypatch, tmp_path):
+    import sys
+
+    model, _, _, _, _ = backend
+    speech_mode(model, monkeypatch, tmp_path)
+    model._sample_rate = 22050
+    detectors = []
+
+    class Detector:
+        def __init__(self, config, *, buffer_size_in_seconds):
+            self.config, self.chunks, self.queue = config, [], []
+            detectors.append(self)
+
+        def accept_waveform(self, samples):
+            self.chunks.append(np.asarray(samples))
+
+        def empty(self):
+            return not self.queue
+
+        @property
+        def front(self):
+            return self.queue[0]
+
+        def pop(self):
+            self.queue.pop(0)
+
+        def flush(self):
+            # Both intervals appear only on flush, including the recording tail.
+            self.queue.extend([SimpleNamespace(start=3200, samples=np.zeros(3200)),
+                               SimpleNamespace(start=7200, samples=np.zeros(8800))])
+
+    module = SimpleNamespace(
+        VadModelConfig=lambda: SimpleNamespace(silero_vad=SimpleNamespace()),
+        VoiceActivityDetector=Detector,
+    )
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", module)
+    samples = np.linspace(-0.2, 0.2, 22050, dtype=np.float32)
+    original = samples.copy()
+    regions = model._speech_regions(samples)
+    assert len(regions) == 1
+    assert regions[0] == (2205, len(samples))  # 0.2s speech start minus 0.1s padding.
+    assert sum(len(chunk) for chunk in detectors[0].chunks) == 16000
+    assert max(len(chunk) for chunk in detectors[0].chunks) == 512
+    assert detectors[0].config.sample_rate == 16000
+    np.testing.assert_array_equal(samples, original)
 
 
 def test_model_mutation_is_rejected_and_settings_change_signature(backend):

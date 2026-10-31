@@ -1,0 +1,19 @@
+# Isolated F5 experiment only: install in .venv-f5, never over the Melo environment.
+# Source and weights are prepared explicitly by scripts/setup_f5.py.
+torch @ https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp311-cp311-linux_x86_64.whl
+torchaudio @ https://download.pytorch.org/whl/cu121/torchaudio-2.5.1%2Bcu121-cp311-cp311-linux_x86_64.whl
+numpy==1.26.4
+scipy==1.15.3
+librosa==0.10.2.post1
+soundfile==0.13.1
+soxr==0.5.0.post1
+safetensors==0.4.5
+vocos==0.1.0
+einops==0.8.1
+x-transformers==1.44.4
+torchdiffeq==0.2.5
+rjieba==0.1.13
+pypinyin==0.50.0
+huggingface-hub==0.23.5
+PyYAML==6.0.2
+tqdm==4.67.1

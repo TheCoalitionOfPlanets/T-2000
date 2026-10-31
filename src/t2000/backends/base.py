@@ -22,7 +22,7 @@ class VoiceBackend(Protocol):
 
     def load(self) -> None: ...
 
-    def prepare(self, reference_path: Path, cache_dir: Path) -> None:
+    def prepare(self, reference_path: Path, cache_dir: Path, *, reference_text: str = "") -> None:
         """Cache conditioning for an immutable normalized reference."""
         ...
 

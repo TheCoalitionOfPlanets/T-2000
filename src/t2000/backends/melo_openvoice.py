@@ -23,8 +23,13 @@ from .base import AudioChunk
 from ..errors import T2000Error
 
 
-ADAPTER_VERSION = "melo-openvoice-v2-native-profile-1"
+ADAPTER_VERSION = "melo-openvoice-v2-speech-profile-2"
 WATERMARK_MESSAGE = "@MyShell"
+REFERENCE_POLICY = {
+    "version": "silero-speech-segments-v1", "sample_rate": 16000, "window_size": 512,
+    "threshold": 0.5, "min_silence_duration": 1.0, "min_speech_duration": 0.1,
+    "max_speech_duration": 30.0, "padding_seconds": 0.1, "segment_seconds": 10.0,
+}
 
 
 def _sha256(path: Path) -> str:
@@ -37,13 +42,20 @@ def _sha256(path: Path) -> str:
 
 class MeloOpenVoiceBackend:
     def __init__(self, model_dir: Path, tts_device="cpu", converter_device="cpu",
-                 speaker="EN-US", language="EN", num_threads=4):
+                 speaker="EN-US", language="EN", num_threads=4, reference_mode="full", tau=0.3):
+        if reference_mode not in {"full", "speech"}:
+            raise T2000Error("Reference mode must be full or speech.")
+        if (isinstance(tau, bool) or not isinstance(tau, (int, float))
+                or not np.isfinite(tau) or not 0 <= tau <= 1):
+            raise T2000Error("Converter tau must be a finite number between 0 and 1.")
         self.model_dir = Path(model_dir).expanduser().resolve()
         self.tts_device = tts_device
         self.converter_device = converter_device
         self.speaker = speaker.upper().replace("_", "-")
         self.language = language.upper()
         self.num_threads = num_threads
+        self.reference_mode = reference_mode
+        self.tau = float(tau)
         self._loaded = False
         self._hash_cache: dict[str, tuple[tuple[int, int, int], str]] = {}
         self._profiles: dict[str, tuple[tuple[int, int], object]] = {}
@@ -95,10 +107,14 @@ class MeloOpenVoiceBackend:
         identity = {"adapter": ADAPTER_VERSION, "files": actual, "speaker": self.speaker,
                     "language": self.language, "tts_device": self.tts_device,
                     "converter_device": self.converter_device, "num_threads": self.num_threads,
-                    "tau": 0.3, "watermark": WATERMARK_MESSAGE}
+                    "tau": self.tau, "watermark": WATERMARK_MESSAGE,
+                    "reference_mode": self.reference_mode}
+        if self.reference_mode == "speech":
+            identity["reference_policy"] = REFERENCE_POLICY
+            identity["vad_sha256"] = _sha256(self._vad_path())
         identity["runtime_versions"] = {}
         for package in ("torch", "numpy", "librosa", "soxr", "transformers", "wavmark", "numba", "nltk",
-                        "setuptools", "g2p-en", "tokenizers"):
+                        "setuptools", "g2p-en", "tokenizers", "sherpa-onnx"):
             try:
                 identity["runtime_versions"][package] = metadata.version(package)
             except metadata.PackageNotFoundError:
@@ -208,7 +224,89 @@ class MeloOpenVoiceBackend:
             samples = soxr.resample(samples, source_rate, self._sample_rate, quality="HQ")
         return np.ascontiguousarray(samples, dtype=np.float32)
 
-    def prepare(self, reference_path: Path, cache_dir: Path) -> None:
+    def _vad_path(self):
+        from ..quality_models import verified_model_path
+
+        return verified_model_path(self.model_dir, "silero_vad.onnx")
+
+    def _speech_regions(self, samples: np.ndarray) -> list[tuple[int, int]]:
+        """Detect speech at 16 kHz, returning padded converter-rate intervals.
+
+        Detection never changes the enrollment WAV or uses the detector's own
+        resampled samples as speaker-encoder input. The exact VAD asset is
+        verified locally; importing this adapter cannot download it.
+        """
+        import soxr
+
+        vad_path = self._vad_path()
+        try:
+            import sherpa_onnx
+        except ImportError as exc:
+            raise T2000Error("Speech-only references require the STT dependencies. "
+                             "Install the project's stt extra before preparing this voice.") from exc
+        policy = REFERENCE_POLICY
+        rate = policy["sample_rate"]
+        if samples.size > 30 * self._sample_rate:
+            raise T2000Error("Use a reference recording of 30 seconds or less.")
+        detection = np.ascontiguousarray(
+            soxr.resample(samples, self._sample_rate, rate, quality="HQ"), dtype=np.float32,
+        )
+        config = sherpa_onnx.VadModelConfig()
+        config.silero_vad.model = str(vad_path)
+        for name in ("threshold", "min_silence_duration", "min_speech_duration",
+                     "max_speech_duration", "window_size"):
+            setattr(config.silero_vad, name, policy[name])
+        config.sample_rate = rate
+        config.num_threads = min(self.num_threads, 2)
+        config.provider = "cpu"
+        detector = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=35)
+        intervals = []
+
+        def drain():
+            while not detector.empty():
+                segment = detector.front
+                start = max(0, int((segment.start / rate - policy["padding_seconds"]) * self._sample_rate))
+                end = min(samples.size, int(np.ceil(
+                    ((segment.start + len(segment.samples)) / rate + policy["padding_seconds"])
+                    * self._sample_rate,
+                )))
+                if end > start:
+                    intervals.append((start, end))
+                detector.pop()
+
+        window = policy["window_size"]
+        for offset in range(0, detection.size, window):
+            detector.accept_waveform(detection[offset:offset + window])
+            drain()
+        detector.flush()
+        drain()
+        merged = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def _reference_segments(self, samples: np.ndarray) -> tuple[list[np.ndarray], dict]:
+        if self.reference_mode == "full":
+            return [samples], {"mode": "full", "segments": 1,
+                               "conditioning_seconds": samples.size / self._sample_rate}
+        intervals = self._speech_regions(samples)
+        if not intervals:
+            raise T2000Error("No speech was detected in this reference. Record a clear single-speaker sentence.")
+        active = np.concatenate([samples[start:end] for start, end in intervals])
+        if active.size < self._sample_rate // 2:
+            raise T2000Error("The reference needs at least half a second of detected speech.")
+        # Match upstream's roughly ten-second, equal-duration chunks, while
+        # accepting useful references shorter than the upstream round-to-zero.
+        count = max(1, round(active.size / self._sample_rate / REFERENCE_POLICY["segment_seconds"]))
+        segments = [np.ascontiguousarray(part) for part in np.array_split(active, count)]
+        return segments, {"mode": "speech", "policy": REFERENCE_POLICY, "segments": len(segments),
+                          "detected_regions": len(intervals),
+                          "conditioning_seconds": active.size / self._sample_rate}
+
+    def prepare(self, reference_path: Path, cache_dir: Path, *, reference_text: str = "") -> None:
         self.load()
         try:
             import soundfile as sf
@@ -224,15 +322,19 @@ class MeloOpenVoiceBackend:
             samples = self._resample(samples.mean(axis=1), rate)
             if samples.size < self._sample_rate // 2 or not np.isfinite(samples).all():
                 raise T2000Error("Use at least half a second of finite reference speech.")
+            segments, conditioning = self._reference_segments(samples)
             with self._torch.inference_mode():
-                embedding = self._converter.model.ref_enc(self._spec(samples).transpose(1, 2)).unsqueeze(-1)
+                embeddings = [self._converter.model.ref_enc(self._spec(segment).transpose(1, 2)).unsqueeze(-1)
+                              for segment in segments]
+                embedding = (embeddings[0] if len(embeddings) == 1
+                             else self._torch.stack(embeddings).mean(0))
             embedding = embedding.detach().cpu()
             cache_dir.mkdir(parents=True, exist_ok=True)
             fd, temp_name = tempfile.mkstemp(prefix="target-", suffix=".tmp", dir=cache_dir)
             os.close(fd)
             try:
                 self._torch.save({"embedding": embedding, "signature": self._loaded_signature,
-                                  "reference_sha256": reference_hash}, temp_name)
+                                  "reference_sha256": reference_hash, "conditioning": conditioning}, temp_name)
                 os.replace(temp_name, cache)
             finally:
                 Path(temp_name).unlink(missing_ok=True)
@@ -297,7 +399,7 @@ class MeloOpenVoiceBackend:
                 spec = self._spec(samples)
                 lengths = self._torch.LongTensor([spec.size(-1)]).to(self.converter_device)
                 converted = self._converter.model.voice_conversion(
-                    spec, lengths, sid_src=self._source, sid_tgt=target, tau=0.3,
+                    spec, lengths, sid_src=self._source, sid_tgt=target, tau=self.tau,
                 )[0][0, 0].detach().cpu().float().numpy()
                 # Keep upstream's @MyShell watermark and short-audio behavior.
                 converted = self._converter.add_watermark(converted, WATERMARK_MESSAGE)
@@ -319,5 +421,6 @@ class MeloOpenVoiceBackend:
         return {"backend": "melo-openvoice-v2", "loaded": self._loaded, "model_dir": str(self.model_dir),
                 "language": self.language, "speaker": self.speaker, "tts_device": self.tts_device,
                 "converter_device": self.converter_device, "sample_rate": getattr(self, "_sample_rate", None),
+                "reference_mode": self.reference_mode, "tau": self.tau,
                 "signature": self._loaded_signature, "streaming": "complete phrases",
                 "watermark": "upstream @MyShell; short phrases may be too short to contain all watermark blocks"}

@@ -42,6 +42,8 @@ class Engine:
                 speaker=self.settings.speaker,
                 language=self.settings.language,
                 num_threads=self.settings.num_threads,
+                reference_mode=self.settings.reference_mode,
+                tau=self.settings.conversion_tau,
             )
         return self._backend
 
@@ -53,6 +55,8 @@ class Engine:
             "devices": {"tts": self.settings.tts_device, "converter": self.settings.converter_device},
             "speaker": self.settings.speaker,
             "language": self.settings.language,
+            "reference_mode": self.settings.reference_mode,
+            "conversion_tau": self.settings.conversion_tau,
             "profiles_count": len(self.store.list()),
             "transport": "phrase PCM over WebSocket",
         }

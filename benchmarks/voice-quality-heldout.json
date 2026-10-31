@@ -1,0 +1,18 @@
+[
+  {
+    "id": "short",
+    "text": "Hello, this is a voice test."
+  },
+  {
+    "id": "names",
+    "text": "Maya and Daniel will meet Priya at the station tomorrow morning."
+  },
+  {
+    "id": "contrast",
+    "text": "I asked for the blue folder, but you brought the green one."
+  },
+  {
+    "id": "paragraph",
+    "text": "The first experiment should measure how quickly the speech begins and whether it can continue without a pause. We should also listen for clear pronunciation, natural rhythm, and a convincing match to the reference speaker."
+  }
+]

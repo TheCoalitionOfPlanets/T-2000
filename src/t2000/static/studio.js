@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const MAX_REFERENCE_SECONDS = 30;
 const MAX_OUTPUT_SECONDS = 120;
 const state = {
-  profiles: [], selected: null, draft: null, draftUrl: null,
+  profiles: [], selected: null, draft: null, draftUrl: null, previewUrl: null, previewValid: false,
   capture: null, capturing: false, saving: false,
   socket: null, generating: false, playback: null, run: null,
 };
@@ -42,12 +42,17 @@ function lastProfile() {
 function updateActions() {
   $('generate-button').disabled = state.generating || state.capturing || state.saving || Boolean(state.draft) || !state.selected || !textValue().trim();
   $('stop-button').disabled = !(state.generating || (state.playback && !state.playback.drained && !state.playback.cancelled));
-  $('save-reference').disabled = !state.draft || state.capturing || state.saving || state.generating;
+  $('save-reference').disabled = !state.draft || !state.previewValid || state.capturing || state.saving || state.generating;
   $('save-transcript').disabled = state.generating || state.saving;
   $('prepare-voice').disabled = state.generating || state.saving || state.capturing;
   $('profile-select').disabled = state.capturing || state.saving || state.generating;
   $('reference-file').disabled = state.capturing || state.saving || state.generating;
   $('record-button').disabled = state.saving || state.generating;
+  $('reference-editor').disabled = state.saving || state.generating || state.capturing;
+  $('edit-reference').disabled = state.saving || state.generating || state.capturing;
+  $('voice-name').disabled = state.saving;
+  $('reference-transcript').disabled = state.saving;
+  $('auto-transcribe').disabled = state.saving;
 }
 
 function textValue() { return $('speech-text').value; }
@@ -84,12 +89,16 @@ async function refreshProfiles(preferred) {
 
 function clearDraft() {
   if (state.draftUrl) URL.revokeObjectURL(state.draftUrl);
+  if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+  state.previewUrl = null;
+  state.previewValid = false;
   state.draftUrl = null;
   state.draft = null;
   $('reference-file').value = '';
   $('draft-fields').hidden = true;
   $('transcribe-label').hidden = true;
   $('save-reference').hidden = true;
+  $('compare-reference').hidden = true;
 }
 
 function selectProfile(id) {
@@ -101,6 +110,7 @@ function selectProfile(id) {
   $('reference-transcript').value = profile.transcript || '';
   $('save-transcript').hidden = false;
   $('prepare-voice').hidden = false;
+  $('edit-reference').hidden = false;
   $('reference-player').src = `/api/profiles/${encodeURIComponent(id)}/audio`;
   $('reference-player').hidden = false;
   $('capture-status').textContent = 'Record or upload a new sample to add another voice.';
@@ -119,6 +129,12 @@ function setDraft(blob, filename, sampleRate, duration) {
   $('reference-player').src = state.draftUrl;
   $('reference-player').hidden = false;
   $('draft-fields').hidden = false;
+  $('edit-reference').hidden = true;
+  $('trim-start').value = '0';
+  $('trim-end').value = '';
+  $('noise-reduction').checked = true;
+  $('auto-trim').checked = false;
+  $('cleanup-status').textContent = 'Preview your changes before saving. You are listening to the original.';
   $('voice-name').value = filename.replace(/\.wav$/i, '') === 'recording' ? 'My voice' : filename.replace(/\.wav$/i, '').slice(0, 80);
   $('reference-transcript').value = '';
   $('transcribe-label').hidden = false;
@@ -130,6 +146,75 @@ function setDraft(blob, filename, sampleRate, duration) {
   $('capture-status').textContent = sampleRate ? `${duration.toFixed(1)} seconds captured at ${(sampleRate / 1000).toFixed(1)} kHz. Listen, then save your reference.` : `${filename} · Listen, then save your reference.`;
   status('Save this reference to use it for generation.');
   updateActions();
+}
+
+function processingData() {
+  const data = new FormData();
+  data.append('file', state.draft.blob, state.draft.filename);
+  const start = Number($('trim-start').value);
+  const end = $('trim-end').value.trim() === '' ? null : Number($('trim-end').value);
+  if ($('trim-start').value.trim() === '' || !Number.isFinite(start) || start < 0 ||
+      (end !== null && (!Number.isFinite(end) || end <= start))) {
+    throw new Error('Choose a valid start and end time. Keep at least one second of speech.');
+  }
+  data.append('start_seconds', String(start));
+  if (end !== null) data.append('end_seconds', String(end));
+  data.append('noise_reduction', String($('noise-reduction').checked));
+  data.append('auto_trim', String($('auto-trim').checked));
+  return data;
+}
+
+function invalidatePreview(clearTranscript = false) {
+  if (!state.draft) return;
+  state.previewValid = false;
+  if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+  state.previewUrl = null;
+  $('compare-reference').hidden = true;
+  $('reference-player').src = state.draftUrl;
+  $('cleanup-status').textContent = 'Changes need a new preview before saving. You are listening to the original.';
+  if (clearTranscript) $('reference-transcript').value = '';
+  updateActions();
+}
+
+async function previewReference() {
+  if (!state.draft || state.saving || state.capturing || state.generating) return;
+  state.saving = true; updateActions();
+  $('cleanup-status').textContent = 'Preparing your preview…';
+  try {
+    const response = await fetch('/api/reference/preview', { method: 'POST', body: processingData() });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(typeof body.detail === 'string' ? body.detail : 'The reference could not be processed. Check your crop times.');
+    }
+    const blob = await response.blob();
+    if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+    state.previewUrl = URL.createObjectURL(blob);
+    state.previewValid = true;
+    $('reference-player').src = state.previewUrl;
+    $('compare-reference').hidden = false;
+    $('compare-reference').textContent = 'Listen to original';
+    const duration = Number(response.headers.get('X-Reference-Duration'));
+    $('cleanup-status').textContent = `Preview ready${Number.isFinite(duration) && duration > 0 ? ` · ${duration.toFixed(2)} seconds` : ''}. Listen and check that the transcript matches the kept words, then save.`;
+    status('Preview ready. Save this reference when it sounds right.');
+  } catch (error) {
+    invalidatePreview();
+    $('cleanup-status').textContent = explain(error);
+    status(explain(error), true);
+  } finally { state.saving = false; updateActions(); }
+}
+
+async function editReference() {
+  if (!state.selected || state.saving || state.generating || state.capturing) return;
+  const selected = state.selected;
+  state.saving = true; updateActions();
+  try {
+    const response = await fetch(`/api/profiles/${encodeURIComponent(selected.id)}/audio`);
+    if (!response.ok) throw new Error('The saved recording is unavailable. Upload or record it again.');
+    setDraft(await response.blob(), `${selected.name}.wav`, selected.sample_rate, selected.duration_seconds);
+    $('voice-name').value = `${selected.name} edited`.slice(0, 80);
+    status('Edit this copy, then preview and save. Your saved voice remains available.');
+  } catch (error) { status(explain(error), true); }
+  finally { state.saving = false; updateActions(); }
 }
 
 function floatWave(chunks, frames, sampleRate) {
@@ -154,7 +239,7 @@ async function startCapture() {
   let context, stream;
   try {
     if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) throw new Error('Microphone recording requires a browser with AudioWorklet on localhost or HTTPS.');
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 } });
     context = new AudioContext(); // Preserve the device/context native sample rate.
     await context.audioWorklet.addModule('/static/playback-worklet.js');
     await context.resume();
@@ -242,12 +327,11 @@ function stopCapture() {
 }
 
 async function saveReference() {
-  if (!state.draft || state.saving || state.capturing) return;
+  if (!state.draft || !state.previewValid || state.saving || state.capturing) return;
   state.saving = true; updateActions();
   status($('auto-transcribe').checked ? 'Saving and transcribing the reference…' : 'Analyzing and saving the reference…');
   try {
-    const data = new FormData();
-    data.append('file', state.draft.blob, state.draft.filename);
+    const data = processingData();
     data.append('name', $('voice-name').value.trim() || 'My voice');
     data.append('transcript', $('reference-transcript').value.trim());
     data.append('transcribe', String($('auto-transcribe').checked));
@@ -510,6 +594,21 @@ $('reference-file').addEventListener('change', () => {
 });
 $('profile-select').addEventListener('change', () => selectProfile($('profile-select').value));
 $('save-reference').addEventListener('click', () => void saveReference());
+$('preview-reference').addEventListener('click', () => void previewReference());
+$('edit-reference').addEventListener('click', () => void editReference());
+for (const id of ['trim-start', 'trim-end', 'auto-trim', 'noise-reduction']) {
+  $(id).addEventListener('input', () => invalidatePreview(id !== 'noise-reduction'));
+}
+$('reset-reference').addEventListener('click', () => {
+  $('trim-start').value = '0'; $('trim-end').value = '';
+  $('noise-reduction').checked = true; $('auto-trim').checked = false;
+  invalidatePreview(true);
+});
+$('compare-reference').addEventListener('click', () => {
+  const original = $('reference-player').src === state.draftUrl;
+  $('reference-player').src = original ? state.previewUrl : state.draftUrl;
+  $('compare-reference').textContent = original ? 'Listen to original' : 'Listen to edited preview';
+});
 $('save-transcript').addEventListener('click', () => void saveTranscript());
 $('prepare-voice').addEventListener('click', () => void prepareVoice());
 $('generate-button').addEventListener('click', () => void generate());

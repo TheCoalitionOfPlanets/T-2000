@@ -49,10 +49,11 @@ Model setup explicitly downloads pinned weights, source, tokenizers and NLP reso
 
 ## Use a voice
 
-1. Record or upload a clean **1–30 second** single-speaker clip. Native sample rate is preserved; a clear 3–10 second spoken sample is a useful starting point.
-2. Save the reference. Optionally transcribe it with CPU STT; Melo/OpenVoice does not require the transcript for cloning.
-3. Choose **Prepare voice for generation** to load models and cache conditioning before timing a request. The first Generate also prepares a voice when needed.
-4. Enter new English text and generate. Each converted phrase plays as it becomes available. Stop clears playback and requests cancellation between model calls.
+1. Record or upload a **1–30 second** single-speaker clip. Native sample rate is preserved; a clear 3–10 second spoken sample is a useful starting point. Browser microphone capture requests noise suppression and echo cancellation where supported.
+2. Use **Clean up and trim** to choose start/end times, reduce background noise (on by default), or trim quiet edges automatically. Click **Preview changes**, listen, and compare with the original. Keep at least one second of speech; **Reset edits** restores the full recording and default cleanup settings. Suppression targets steady hiss and hum; competing voices, music and strong room echo may remain.
+3. Save the previewed reference. Optionally transcribe it with CPU STT; Melo/OpenVoice does not require the transcript for cloning. Cropping clears draft words so the transcript can match the kept speech. Cleanup runs before analysis, transcription and voice conditioning. **Clean up or trim this voice** edits a saved reference as a new copy, keeping the previous voice and its cached conditioning available.
+4. Choose **Prepare voice for generation** to load models and cache conditioning before timing a request. The first Generate also prepares a voice when needed.
+5. Enter new English text and generate. Each converted phrase plays as it becomes available. Stop clears playback and requests cancellation between model calls.
 
 The studio shows estimated first-audible latency, generation time, real-time factor (RTF), and playback gaps. **RTF below 1** means generation is faster than playback. Audible timing is estimated from browser rendering/device latency. Server generation timing excludes loading and enrollment, which are logged separately.
 
@@ -63,12 +64,15 @@ To reuse T-1000's downloaded recognition weights, point `STT_MODEL_DIR` at that 
 ```sh
 .venv/bin/t2000 doctor
 .venv/bin/t2000 enroll /path/to/reference.wav --name 'My voice' --prepare
+.venv/bin/t2000 enroll /path/to/reference.wav --name 'Clean voice' --start-seconds 0.5 --end-seconds 8 --auto-trim
 .venv/bin/t2000 generate --profile PROFILE_ID --text 'Hello, this is a voice test.'
 .venv/bin/python scripts/benchmark.py --reference /path/to/reference.wav \
   --repeats 3 --output-dir data/benchmarks/first-run
 ```
 
 Enrollment prints the profile ID. The benchmark uses [eight English cases](benchmarks/english.json), randomized request order, excluded warmups and separate loading/preparation measurements. It saves JSON, CSV, Markdown, request metadata and WAV paths. Failures remain in failure counts and do not enter successful latency summaries. Repeat `--reference` for more voices. See [the GPU guide](docs/gpu.md) for measurement limits.
+
+CLI and API enrollment enable background suppression by default; CLI `--no-noise-reduction` or API form field `noise_reduction=false` keeps the original sound. `start_seconds`, `end_seconds`, and `auto_trim` are also available as enrollment form fields. `POST /api/reference/preview` accepts the same audio and processing fields and returns a disposable WAV without creating a profile. Programmatic `ProfileStore.create` preserves its original default behavior unless processing options are supplied. References over 30 seconds must be shortened before upload.
 
 ## Configuration
 

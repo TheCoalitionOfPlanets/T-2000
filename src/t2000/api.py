@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import io
 import logging
 import queue
 import re
@@ -9,11 +10,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
+from .audio import prepare_reference
 from .engine import Cancelled, Engine
 from .errors import T2000Error
 from .profiles import ProfileStore
@@ -71,13 +73,7 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
     def profiles():
         return store.list()
 
-    @app.post("/api/profiles", status_code=201)
-    async def enroll(
-        file: UploadFile = File(...), name: str = Form("Reference"),
-        transcript: str = Form(""), transcribe: bool = Form(False),
-    ):
-        if not 1 <= len(name.strip()) <= 120 or len(transcript) > 5000:
-            raise T2000Error("Use a voice name of 1–120 characters and a transcript under 5000 characters.")
+    async def receive_upload(file: UploadFile) -> Path:
         upload_dir = settings.data_dir / ".uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         path = None
@@ -90,7 +86,52 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
                     if total > settings.max_upload_bytes:
                         raise HTTPException(status_code=413, detail="Reference upload exceeds 16 MB.")
                     out.write(block)
-            profile = await asyncio.to_thread(store.create, path, name.strip(), transcript.strip())
+            return path
+        except BaseException:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            await file.close()
+
+    @app.post("/api/reference/preview")
+    async def preview_reference(
+        file: UploadFile = File(...), start_seconds: float = Form(0),
+        end_seconds: float | None = Form(None), noise_reduction: bool = Form(True),
+        auto_trim: bool = Form(False),
+    ):
+        """Return a disposable preview; saving uses the same deterministic processing."""
+        import soundfile as sf
+
+        path = await receive_upload(file)
+        try:
+            audio = await asyncio.to_thread(
+                prepare_reference, path, start_seconds=start_seconds, end_seconds=end_seconds,
+                noise_reduction=noise_reduction, auto_trim=auto_trim,
+            )
+            target = io.BytesIO()
+            await asyncio.to_thread(sf.write, target, audio.samples, audio.sample_rate, format="WAV", subtype="FLOAT")
+            return Response(target.getvalue(), media_type="audio/wav", headers={
+                "Cache-Control": "no-store", "X-Reference-Duration": str(audio.duration_seconds),
+            })
+        finally:
+            path.unlink(missing_ok=True)
+
+    @app.post("/api/profiles", status_code=201)
+    async def enroll(
+        file: UploadFile = File(...), name: str = Form("Reference"),
+        transcript: str = Form(""), transcribe: bool = Form(False),
+        start_seconds: float = Form(0), end_seconds: float | None = Form(None),
+        noise_reduction: bool = Form(True), auto_trim: bool = Form(False),
+    ):
+        if not 1 <= len(name.strip()) <= 120 or len(transcript) > 5000:
+            raise T2000Error("Use a voice name of 1–120 characters and a transcript under 5000 characters.")
+        path = await receive_upload(file)
+        try:
+            profile = await asyncio.to_thread(
+                store.create, path, name.strip(), transcript.strip(), start_seconds=start_seconds,
+                end_seconds=end_seconds, noise_reduction=noise_reduction, auto_trim=auto_trim,
+            )
             if transcribe:
                 from .stt import transcribe_file
 
@@ -105,9 +146,7 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
                     profile = dict(profile, transcription_error=str(exc))
             return profile
         finally:
-            await file.close()
-            if path is not None:
-                path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
 
     @app.patch("/api/profiles/{profile_id}")
     def transcript_update(profile_id: str, update: TranscriptUpdate):

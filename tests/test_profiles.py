@@ -112,6 +112,20 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(T2000Error, "damaged"):
             self.store.get(profile["id"])
 
+    def test_processed_voice_uses_new_conditioning_and_keeps_original(self):
+        sf.write(self.source, np.tile(self.samples, 3), self.rate, subtype="FLOAT")
+        original = self.store.create(self.source, "Original", "All words")
+        original_path = self.store.reference_path(original["id"])
+        before = original_path.read_bytes()
+        edited = self.store.create(self.source, "Cropped", "Kept words", start_seconds=1, end_seconds=3,
+                                   noise_reduction=True)
+        self.assertNotEqual(original["id"], edited["id"])
+        self.assertNotEqual(self.store.conditioning_dir(original["id"], "backend"),
+                            self.store.conditioning_dir(edited["id"], "backend"))
+        self.assertEqual(edited["duration_seconds"], 2)
+        self.assertEqual(edited["sample_rate"], self.rate)
+        self.assertEqual(original_path.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

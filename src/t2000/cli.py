@@ -20,6 +20,10 @@ def main():
     enroll.add_argument("--transcript", default="")
     enroll.add_argument("--transcribe", action="store_true")
     enroll.add_argument("--prepare", action="store_true")
+    enroll.add_argument("--start-seconds", type=float, default=0, help="Keep audio from this time")
+    enroll.add_argument("--end-seconds", type=float, help="Keep audio up to this time")
+    enroll.add_argument("--no-noise-reduction", action="store_true", help="Keep the original background sound")
+    enroll.add_argument("--auto-trim", action="store_true", help="Trim quiet edges with speech padding")
     generate = sub.add_parser("generate", help="Generate a complete WAV using an enrolled profile")
     generate.add_argument("--profile", required=True)
     generate.add_argument("--text", required=True)
@@ -50,7 +54,9 @@ def main():
                 app.state.engine.loaded = True
             uvicorn.run(app, host=args.host, port=args.port, ws_max_size=65536)
         elif args.command == "enroll":
-            profile = store.create(args.reference, args.name, args.transcript)
+            profile = store.create(args.reference, args.name, args.transcript, start_seconds=args.start_seconds,
+                                   end_seconds=args.end_seconds, noise_reduction=not args.no_noise_reduction,
+                                   auto_trim=args.auto_trim)
             if args.transcribe:
                 from .stt import transcribe_file
 

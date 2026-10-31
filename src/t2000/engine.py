@@ -1,4 +1,7 @@
 import json
+import importlib.util
+from dataclasses import replace
+import gc
 import logging
 import math
 import threading
@@ -29,10 +32,30 @@ class Engine:
         self._backend = backend
         self._lock = threading.Lock()
         self.loaded = False
+        self._reference_delivery = None
 
     @property
     def backend(self) -> VoiceBackend:
         if self._backend is None:
+            if self.settings.backend in {"t1000-soar", "t1000-mf2"}:
+                from .backends.t1000 import T1000Backend
+
+                self._backend = T1000Backend(
+                    self.settings.model_dir, python_executable=self.settings.t1000_python,
+                    t1000_root=self.settings.t1000_root,
+                    model="soar" if self.settings.backend == "t1000-soar" else "mf2",
+                    device=self.settings.tts_device, num_threads=self.settings.num_threads,
+                )
+                return self._backend
+            if self.settings.backend == "f5-tts-v1":
+                from .backends.f5 import F5Backend
+
+                self._backend = F5Backend(
+                    self.settings.model_dir, python_executable=self.settings.f5_python,
+                    device=self.settings.tts_device, num_threads=self.settings.num_threads,
+                    steps=self.settings.f5_steps,
+                )
+                return self._backend
             from .backends.melo_openvoice import MeloOpenVoiceBackend
 
             self._backend = MeloOpenVoiceBackend(
@@ -49,17 +72,89 @@ class Engine:
 
     def status(self) -> dict:
         return {
-            "backend": "melo-openvoice-v2",
+            "backend": self.settings.backend,
             "loaded": self.loaded,
             "busy": self._lock.locked(),
-            "devices": {"tts": self.settings.tts_device, "converter": self.settings.converter_device},
-            "speaker": self.settings.speaker,
+            "devices": {"tts": self.settings.tts_device,
+                        "converter": self.settings.converter_device if self.settings.backend == "melo-openvoice-v2"
+                        else None},
+            "speaker": self.settings.speaker if self.settings.backend == "melo-openvoice-v2" else "reference",
             "language": self.settings.language,
             "reference_mode": self.settings.reference_mode,
             "conversion_tau": self.settings.conversion_tau,
+            "max_reference_seconds": self.max_reference_seconds,
+            "available_backends": self.available_backends(),
+            "delivery_planner": {"enabled": True, "type": "deterministic", "version": "context-v1"},
+            "speed_control": {"enabled": not self.settings.backend.startswith("t1000-"),
+                              "default": 1.0, "method": "native_reference" if
+                              self.settings.backend.startswith("t1000-") else "model_pace"},
             "profiles_count": len(self.store.list()),
             "transport": "phrase PCM over WebSocket",
+            "stt": {
+                "enabled_by_default": True, "device": "cpu",
+                "available": importlib.util.find_spec("sherpa_onnx") is not None and all(
+                    (self.settings.stt_model_dir / filename).is_file()
+                    for filename in ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+                ),
+            },
         }
+
+    @property
+    def max_reference_seconds(self) -> int:
+        return {"f5-tts-v1": 12, "t1000-soar": 6, "t1000-mf2": 6}.get(self.settings.backend, 30)
+
+    def available_backends(self) -> list[dict]:
+        root = self.settings.model_dir
+        t1000 = self.settings.t1000_root
+        return [
+            {"id": "t1000-soar", "label": "T-1000 SOAR · Reference quality",
+             "available": self.settings.tts_device.startswith("cuda") and self.settings.t1000_python.is_file()
+             and (t1000 / "data/models/dots.tts-soar/model.safetensors").is_file()},
+            {"id": "t1000-mf2", "label": "T-1000 MF2 · Faster reference",
+             "available": self.settings.tts_device.startswith("cuda") and self.settings.t1000_python.is_file()
+             and (t1000 / "data/models/dots.tts-mf-2steps/model.safetensors").is_file()},
+            {"id": "f5-tts-v1", "label": "F5 · Direct voice",
+             "available": self.settings.f5_python.is_file() and (root / "f5/manifest.json").is_file()},
+            {"id": "melo-openvoice-v2", "label": "Melo/OpenVoice · Fast",
+             "available": (root / "manifest.json").is_file()},
+        ]
+
+    def switch_backend(self, backend_id: str) -> dict:
+        available = {item["id"]: item["available"] for item in self.available_backends()}
+        if backend_id not in available or not available[backend_id]:
+            raise T2000Error("That voice engine is not installed on this system.")
+        if not self._lock.acquire(blocking=False):
+            raise T2000Error("Wait for the current speech request before changing engines.")
+        try:
+            if backend_id != self.settings.backend:
+                previous = self._backend
+                self.close()
+                self._backend = None
+                del previous
+                # Melo keeps an upstream BERT module-global reference. Release it
+                # before another complete synthesis stack can occupy the GPU.
+                import sys
+
+                bert = sys.modules.get("melo.text.english_bert")
+                if bert is not None:
+                    bert.model = None
+                gc.collect()
+                torch = sys.modules.get("torch")
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self.settings = replace(self.settings, backend=backend_id)
+            result = self.status()
+            result["busy"] = False  # The switch itself owns the idle model lock.
+            return result
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        if self._backend is not None:
+            close = getattr(self._backend, "close", None)
+            if close is not None:
+                close()
+        self.loaded = False
 
     def _acquire(self, cancel: threading.Event) -> None:
         while not self._lock.acquire(timeout=0.1):
@@ -74,7 +169,18 @@ class Engine:
             raise Cancelled("Generation cancelled.")
 
     def _prepare(self, profile_id, cancel, emit):
-        self.store.get(profile_id)
+        profile = self.store.get(profile_id)
+        if getattr(self.backend, "requires_reference_text", False) and not profile["transcript"]:
+            from .stt import transcribe_file
+
+            emit({"type": "transcribing"})
+            words = transcribe_file(
+                self.store.reference_path(profile_id), self.settings.stt_model_dir,
+                num_threads=self.settings.num_threads, max_seconds=30,
+            )
+            if not words.strip():
+                raise T2000Error("No reference words were recognized. Type the exact recording transcript.")
+            profile = self.store.update_transcript(profile_id, words, only_if_empty=True)
         self._check(cancel)
         emit({"type": "loading"})
         started = time.perf_counter()
@@ -84,9 +190,23 @@ class Engine:
         self._check(cancel)
         emit({"type": "preparing"})
         started = time.perf_counter()
+        profile = self.store.get(profile_id)
         signature = self.backend.signature()
-        cache_dir = self.store.conditioning_dir(profile_id, signature)
-        self.backend.prepare(self.store.reference_path(profile_id), cache_dir)
+        cache_dir = self.store.conditioning_dir(profile_id, signature, transcript=profile["transcript"])
+        self.backend.prepare(self.store.reference_path(profile_id), cache_dir, reference_text=profile["transcript"])
+        self._reference_delivery = None
+        if self.settings.backend != "melo-openvoice-v2":
+            from .delivery import reference_delivery_profile
+
+            try:
+                self._reference_delivery = reference_delivery_profile(
+                    self.store.reference_path(profile_id), profile["transcript"],
+                    self.settings.model_dir, cache_dir,
+                )
+            except T2000Error as exc:
+                # Optional diagnostics never replace the original reference or
+                # prevent the neural backend from using its complete context.
+                self._reference_delivery = {"available": False, "reason": str(exc)}
         prepare_seconds = time.perf_counter() - started
         self._check(cancel)
         return cache_dir, signature, load_seconds, prepare_seconds
@@ -97,7 +217,8 @@ class Engine:
         try:
             _, signature, load_seconds, prepare_seconds = self._prepare(profile_id, cancel, lambda _: None)
             return {"profile_id": profile_id, "signature": signature, "load_seconds": load_seconds,
-                    "prepare_seconds": prepare_seconds, "ready": True}
+                    "prepare_seconds": prepare_seconds, "ready": True,
+                    "delivery_profile": self._reference_delivery}
         finally:
             self._lock.release()
 
@@ -117,7 +238,10 @@ class Engine:
             raise T2000Error("Speed must be between 0.7 and 1.4.")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFF:
             raise T2000Error("Seed must be between 0 and 4294967295.")
-        phrases = split_phrases(text, self.settings.phrase_chars)
+        if not text.strip():
+            raise T2000Error("Enter text to speak.")
+        phrases = (split_phrases(text, self.settings.phrase_chars)
+                   if self.settings.backend == "melo-openvoice-v2" else None)
         self.store.get(profile_id)
         submitted = time.perf_counter()
         emit({"type": "queued"})
@@ -131,6 +255,17 @@ class Engine:
             output_dir.mkdir(parents=True, exist_ok=True)
             cache_dir, signature, load_seconds, prepare_seconds = self._prepare(profile_id, cancel, emit)
             started = time.perf_counter()
+            delivery_plan = None
+            if self.settings.backend != "melo-openvoice-v2":
+                from .delivery import plan_delivery
+
+                profile = self.store.get(profile_id)
+                delivery_plan = plan_delivery(
+                    text, max_chars=600 if self.settings.backend == "f5-tts-v1" else 150,
+                    reference_seconds=profile["duration_seconds"], reference_text=profile["transcript"],
+                    speed=speed, max_context_seconds=27 if self.settings.backend == "f5-tts-v1" else None,
+                )
+                phrases = [segment["text"] for segment in delivery_plan["segments"]]
             first_pcm = None
             previous_pcm = None
             gaps = []
@@ -199,10 +334,12 @@ class Engine:
                 "max_phrase_gap_seconds": max(gaps, default=0.0), "sample_rate": sample_rate,
                 "peak_before_clip": peak, "clipped_fraction": clipped_samples / frames,
                 "request_seconds": time.perf_counter() - submitted,
+                "planning_seconds": delivery_plan["planning_seconds"] if delivery_plan else 0.0,
             }
             report = {"job_id": job_id, "profile_id": profile_id, "text": text, "seed": seed,
                       "speed": speed, "backend_signature": signature, "backend": self.backend.info(),
-                      "metrics": metrics, "complete": True}
+                      "metrics": metrics, "complete": True,
+                      "delivery_plan": delivery_plan, "reference_delivery": self._reference_delivery}
             report_tmp = output_dir / f".{job_id}.json.part"
             report_tmp.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
             self._check(cancel)

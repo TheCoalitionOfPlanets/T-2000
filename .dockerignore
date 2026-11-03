@@ -1,0 +1,17 @@
+# Include only the application, vendored runtime and dependency manifests.
+**
+!Dockerfile
+!docker-entrypoint.sh
+!pyproject.toml
+!README.md
+!requirements/
+!requirements/**
+!src/
+!src/**
+!scripts/
+!scripts/**
+!runtime/
+!runtime/**
+**/__pycache__/
+**/*.py[cod]
+**/.DS_Store

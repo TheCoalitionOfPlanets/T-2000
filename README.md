@@ -31,6 +31,30 @@ See [the architecture and benchmark proposal](docs/architecture.md) for T-1000 r
 
 ## Start the studio
 
+On any machine with an NVIDIA GPU, Docker Engine with the Compose plugin, and the
+NVIDIA Container Toolkit:
+
+```sh
+docker compose up -d --build
+```
+
+That is the whole setup. No host checkout of T-1000, no virtual environment and
+no manual model download: the image carries the studio and the pinned `dots.tts`
+runtime, and the first start fetches and verifies about 10 GB of weights into a
+named volume. Watch it with `docker compose logs -f studio`, then open
+**http://127.0.0.1:7861** on that machine, or forward port 7861 over SSH.
+
+The image ships T-1000 SOAR and MF2 and defaults to the `high-vram` profile:
+a dense BF16 language model with the upstream sequence limits, sized for cards
+with roughly 8 GB of VRAM or more. On a 16 GB card it needs no tuning. Smaller
+cards can set `T2000_T1000_PROFILE=low-vram`, which quantizes the language model
+to NF4 and additionally needs bitsandbytes in the worker environment.
+
+On the original 3050 laptop, `./start.sh` still reuses the installed image or
+its recovery archive and releases the native T-1000 studio's GPU first.
+See [Docker setup and operations](docs/docker.md) for profiles, the model
+provisioning step, persistent data, and stop/log commands.
+
 Use Python 3.11 and [uv](https://docs.astral.sh/uv/). From this directory:
 
 ```sh

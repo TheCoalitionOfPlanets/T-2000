@@ -1,0 +1,64 @@
+name: t2000
+
+# Self-contained T-1000 studio. One command brings it up on a CUDA GPU:
+#
+#     docker compose up -d --build
+#
+# No host checkout, virtualenv or model download is needed first. The first
+# start fetches about 10 GB of pinned weights into the `models` volume and
+# verifies their SHA-256; later starts reuse them.
+
+services:
+  studio:
+    image: t2000:gpu
+    build:
+      context: .
+      target: runtime
+    init: true
+    user: "1000:1000"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${T2000_PORT:-7861}:7861"
+    environment:
+      # SOAR is the higher-quality engine; MF2 is several times faster.
+      T2000_BACKEND: "${T2000_BACKEND:-t1000-mf2}"
+      # high-vram keeps the language model dense in BF16 and restores the
+      # upstream sequence limits. Use low-vram only on cards under ~8 GB,
+      # which also requires bitsandbytes in the worker environment.
+      T2000_T1000_PROFILE: "${T2000_T1000_PROFILE:-high-vram}"
+      T2000_TTS_DEVICE: "${T2000_TTS_DEVICE:-cuda:0}"
+      T2000_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
+      OMP_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
+      MKL_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+    volumes:
+      # Weights, saved voices, recordings and generated WAVs. Named volumes so
+      # a fresh clone needs no host directories prepared in advance.
+      - models:/app/data
+      - cache:/app/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # Prompt latents and vocoder batches move through shared memory.
+    shm_size: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 45s
+
+volumes:
+  models:
+  cache:

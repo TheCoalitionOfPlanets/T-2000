@@ -63,7 +63,7 @@ function updateActions() {
   $('reference-editor').disabled = state.saving || state.generating || state.capturing;
   $('edit-reference').disabled = state.saving || state.generating || state.capturing;
   $('voice-engine').disabled = !state.runtimeReady || state.saving || state.generating || state.capturing || state.availableBackends.length < 2;
-  for (const id of ['speech-text', 'speech-speed', 'speech-seed', 'reference-transcript', 'voice-name', 'auto-transcribe']) $(id).disabled = state.saving;
+  for (const id of ['speech-text', 'speech-speed', 'speech-seed', 'sentence-gap', 'reference-transcript', 'voice-name', 'auto-transcribe']) $(id).disabled = state.saving;
   $('speech-speed').disabled = state.saving || !state.speedControlEnabled;
   if (!state.speedControlEnabled) { $('speech-speed').value = '1'; renderSpeed(); }
   $('empty-output').hidden = state.generating || !$('output-section').hidden;
@@ -76,6 +76,10 @@ function textValue() { return $('speech-text').value; }
 
 function renderSpeed() {
   $('speed-value').value = `${Number($('speech-speed').value).toFixed(2).replace(/0$/, '')}×`;
+}
+
+function renderSentenceGap() {
+  $('sentence-gap-value').value = `${Number($('sentence-gap').value).toFixed(2)} s`;
 }
 
 function applyRuntime(runtime) {
@@ -102,7 +106,9 @@ function applyRuntime(runtime) {
     state.runtimeReady = true;
     state.maxReferenceSeconds = Number.isFinite(runtime.max_reference_seconds) && runtime.max_reference_seconds >= 1 && runtime.max_reference_seconds <= 30
       ? runtime.max_reference_seconds : t1000 ? 6 : directVoice ? 12 : 30;
-    state.recommendedReferenceSeconds = t1000 ? '3–6' : directVoice ? '8–12' : '10–20';
+    state.recommendedReferenceSeconds = t1000
+      ? `3–${state.maxReferenceSeconds}`
+      : directVoice ? '8–12' : '10–20';
     $('reference-description').textContent = `For voice likeness, start with ${state.recommendedReferenceSeconds} seconds of clean speech. One voice, with as little background noise as possible.`;
     $('help-reference-guidance').textContent = `Record or upload ${state.recommendedReferenceSeconds} seconds of clear, single-speaker speech, up to ${state.maxReferenceSeconds} seconds. Listen back for noise, clipping, and long silences. Shorter clips still work.`;
     if (!state.capturing && !state.draft) $('capture-status').textContent = `Aim for ${state.recommendedReferenceSeconds} seconds of clear speech. Up to ${state.maxReferenceSeconds} seconds.`;
@@ -601,12 +607,17 @@ async function generate() {
   if (state.selected.duration_seconds > state.maxReferenceSeconds) { status(`Choose a reference of ${state.maxReferenceSeconds} seconds or less before generating.`, true); return; }
   const seed = Number($('speech-seed').value);
   const speed = state.speedControlEnabled ? Number($('speech-speed').value) : 1;
+  const sentenceGap = Number($('sentence-gap').value);
   if (!Number.isInteger(seed) || seed < 0 || seed > 4294967295 || !Number.isFinite(speed) || speed < 0.7 || speed > 1.4) {
     status('Use a whole-number seed from 0 to 4294967295 and a speed from 0.7× to 1.4×.', true);
     return;
   }
+  if (!Number.isFinite(sentenceGap) || sentenceGap < 0 || sentenceGap > 2) {
+    status('Use a sentence pause between 0 and 2 seconds.', true);
+    return;
+  }
   const submitted = performance.now();
-  const request = { profile_id: state.selected.id, text: textValue().trim(), speed, seed };
+  const request = { profile_id: state.selected.id, text: textValue().trim(), speed, seed, sentence_gap: sentenceGap };
   const run = { cancelled: false };
   state.run = run;
   state.generating = true; updateActions();
@@ -809,6 +820,7 @@ $('speech-speed').addEventListener('input', () => {
   else $('speech-speed').value = '1';
   renderSpeed();
 });
+$('sentence-gap').addEventListener('input', renderSentenceGap);
 $('speech-text').addEventListener('input', () => { $('character-count').textContent = `${textValue().length.toLocaleString()} / 3,000`; updateActions(); });
 document.addEventListener('keydown', (event) => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); void generate(); } });
 window.addEventListener('pagehide', () => {
@@ -818,6 +830,7 @@ window.addEventListener('pagehide', () => {
 });
 new ResizeObserver(() => { if (state.selected && !$('analysis-panel').hidden) drawAnalysis(state.selected.analysis || {}); }).observe($('analysis-panel'));
 $('character-count').textContent = `${textValue().length.toLocaleString()} / 3,000`;
+renderSentenceGap();
 updateActions();
 void refreshStatus();
 refreshProfiles().catch((error) => status(explain(error), true));

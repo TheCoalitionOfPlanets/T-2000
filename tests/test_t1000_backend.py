@@ -188,7 +188,7 @@ def test_raw_and_sentence_policy_have_distinct_conditioning_identity(tmp_path, m
         (model_path / name).write_text('{}' if name == "config.json" else name)
     source = root / "apps/api/src/t1000"
     source.mkdir(parents=True)
-    for name in adapter.SOURCE_FILES:
+    for name in adapter.PROFILE_SOURCES["low-vram"]:
         (source / name).write_text(name)
     monkeypatch.setitem(adapter.MODEL_PINS, "soar", {
         **adapter.MODEL_PINS["soar"], "sha256": sha256(model_path / "model.safetensors"),

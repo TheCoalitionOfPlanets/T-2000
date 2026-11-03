@@ -28,7 +28,11 @@ RUNTIME_REVISION = "b65ca7149fb43b8fb8d52916aa12738deda7b188"
 MODEL_FILES = ("model.safetensors", "speaker_encoder.safetensors", "vocoder.safetensors", "config.json",
                "llm_config.json", "latent_stats.pt", "tokenizer.json", "tokenizer_config.json",
                "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt", "chat_template.jinja")
-SOURCE_FILES = ("low_vram.py", "references.py", "eager.py", "vocoder.py")
+PROFILE_SOURCES = {"low-vram": ("low_vram.py", "references.py", "eager.py", "vocoder.py"),
+                   "high-vram": ("high_vram.py", "references.py", "eager.py", "vocoder.py")}
+# The speaker encoder crops to config.xvec_max_audio_seconds (10 s); past that it
+# takes a random window, so a longer reference adds nothing and varies per seed.
+PROFILE_REFERENCE_SECONDS = {"low-vram": 6, "high-vram": 10}
 REFERENCE_BOUNDARY_POLICY = "neutral-terminal-punctuation-v1"
 
 
@@ -55,9 +59,12 @@ class T1000Backend(F5Backend):
     max_reference_seconds = 6
 
     def __init__(self, model_dir: Path, *, python_executable: Path, t1000_root: Path,
-                 model="soar", device="cuda:0", num_threads=4, reference_boundary="sentence"):
+                 model="soar", device="cuda:0", num_threads=4, reference_boundary="sentence",
+                 profile="low-vram", runtime_source: Path | None = None):
         if model not in MODEL_PINS:
             raise T2000Error("T-1000 model must be soar or mf2.")
+        if profile not in PROFILE_SOURCES:
+            raise T2000Error("T-1000 profile must be low-vram or high-vram.")
         if not isinstance(device, str) or not device.startswith("cuda"):
             raise T2000Error("The reused T-1000 low-VRAM runtime requires CUDA.")
         if reference_boundary not in {"raw", "sentence"}:
@@ -66,6 +73,11 @@ class T1000Backend(F5Backend):
         self.t1000_root = Path(t1000_root).expanduser().resolve()
         self.model = model
         self.reference_boundary = reference_boundary
+        self.profile = profile
+        self.max_reference_seconds = PROFILE_REFERENCE_SECONDS[profile]
+        # Vendored runtime by default; an external T-1000 checkout still works.
+        self.runtime_source = (Path(runtime_source).expanduser().resolve() if runtime_source
+                               else self.t1000_root / "apps/api/src")
         self.bundle_dir = self.t1000_root / "data/models" / MODEL_PINS[model]["directory"]
         self._worker_script = self._project / "scripts/t1000_infer_worker.py"
         self._runtime_info = None
@@ -74,9 +86,9 @@ class T1000Backend(F5Backend):
         try:
             if not self.python_executable.is_file():
                 raise ValueError("The existing T-1000 environment interpreter is missing")
-            source = self.t1000_root / "apps/api/src/t1000"
+            source = self.runtime_source / "t1000"
             paths = {"models/" + name: self.bundle_dir / name for name in MODEL_FILES}
-            paths.update({"t1000/" + name: source / name for name in SOURCE_FILES})
+            paths.update({"t1000/" + name: source / name for name in PROFILE_SOURCES[self.profile]})
             stamp = [(name, path.stat().st_size, path.stat().st_mtime_ns, path.stat().st_ctime_ns)
                      for name, path in sorted(paths.items())]
             if stamp != self._identity_stamp:
@@ -92,10 +104,12 @@ class T1000Backend(F5Backend):
                 self._identity_cache = {"files_sha256": hashes, "revision": MODEL_PINS[self.model]["revision"]}
                 self._identity_stamp = stamp
             if self._runtime_info is None:
+                # bitsandbytes only ships with the quantized low-VRAM profile.
+                names = "['torch','torchaudio','dots-tts','accelerate']" if self.profile == "high-vram" \
+                    else "['torch','torchaudio','dots-tts','bitsandbytes','accelerate']"
                 command = (
                     "import importlib.metadata as m,json; d=m.distribution('dots-tts'); "
-                    "print(json.dumps({'versions':{n:m.version(n) for n in "
-                    "['torch','torchaudio','dots-tts','bitsandbytes','accelerate']},"
+                    f"print(json.dumps({{'versions':{{n:m.version(n) for n in {names}}},"
                     "'dots_direct_url':json.loads(d.read_text('direct_url.json') or '{}')}))"
                 )
                 result = subprocess.run([str(self.python_executable), "-c", command],
@@ -107,7 +121,9 @@ class T1000Backend(F5Backend):
                     "model": self.model, "python": str(self.python_executable),
                     "t1000_root": str(self.t1000_root), "device": self.device, "num_threads": self.num_threads,
                     "worker_sha256": sha256(self._worker_script), "adapter_sha256": sha256(Path(__file__)),
-                    "reference_trim": False, "precision": "bfloat16", "llm": "nf4",
+                    "reference_trim": False, "precision": "bfloat16",
+                    "llm": "bfloat16" if self.profile == "high-vram" else "nf4",
+                    "profile": self.profile, "runtime_source": str(self.runtime_source),
                     "reference_boundary": self.reference_boundary, "reference_boundary_policy": REFERENCE_BOUNDARY_POLICY,
                     "sampling": "SOAR10/CFG1.2" if self.model == "soar" else "trained MF2 defaults"}
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -135,15 +151,18 @@ class T1000Backend(F5Backend):
             try:
                 self._process = subprocess.Popen(
                     [str(self.python_executable), str(self._worker_script), "--t1000-root", str(self.t1000_root),
-                     "--model", self.model, "--device", self.device, "--num-threads", str(self.num_threads)],
+                     "--model", self.model, "--device", self.device, "--num-threads", str(self.num_threads),
+                     "--profile", self.profile, "--runtime-source", str(self.runtime_source)],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr, text=True, bufsize=1,
                     cwd=self._project,
                 )
                 self._exchange({"command": "load"})
                 self._loaded_signature = signature
             except OSError as exc:
+                details = self._diagnostics()
                 self.close()
-                raise T2000Error(f"Could not start the T-1000 worker: {exc}") from exc
+                raise T2000Error(f"Could not start the T-1000 worker: {exc}"
+                                 + (f" ({details})" if details else "")) from exc
             except BaseException:
                 self.close()
                 raise
@@ -158,7 +177,8 @@ class T1000Backend(F5Backend):
         except (OSError, RuntimeError) as exc:
             raise T2000Error(f"Could not read the T-1000 reference: {exc}") from exc
         if not 1 <= info.duration <= self.max_reference_seconds:
-            raise T2000Error("Use a complete 1–6 second T-1000 low-VRAM reference with its matching words.")
+            raise T2000Error(f"Use a complete 1–{self.max_reference_seconds} second T-1000 reference "
+                             "with its matching words.")
         with self._lock:
             self.load()
             cache_dir = Path(cache_dir)
@@ -231,7 +251,8 @@ class T1000Backend(F5Backend):
                 return AudioChunk(np.ascontiguousarray(samples[:, 0]), rate, seconds, 0.0)
 
     def info(self):
-        return {"backend": f"t1000-{self.model}", "loaded": self._process is not None
+        return {"backend": f"t1000-{self.model}", "profile": self.profile,
+                "loaded": self._process is not None
                 and self._process.poll() is None and self._loaded_signature is not None,
                 "model_dir": str(self.bundle_dir), "t1000_root": str(self.t1000_root),
                 "tts_device": self.device, "converter_device": None, "sample_rate": 48000,

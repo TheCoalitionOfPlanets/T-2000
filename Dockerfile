@@ -42,15 +42,22 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git g++ \
     && rm -rf /var/lib/apt/lists/*
 ENV UV_PYTHON_DOWNLOADS=never UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 \
-    UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=4
+    UV_LINK_MODE=copy UV_CONCURRENT_DOWNLOADS=4 \
+    PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=5
 COPY requirements/t1000-worker-cuda.txt /tmp/t1000-worker.txt
-RUN --mount=type=cache,id=t2000-uv,target=/root/.cache/uv \
-    uv venv --python /usr/local/bin/python /opt/t1000 \
-    && uv pip install --python /opt/t1000/bin/python \
+# uv creates the environment, but pip performs the downloads. uv's HTTP/2
+# client stalls indefinitely against download.pytorch.org behind some
+# inspecting corporate proxies: the process sleeps with its connections open
+# and makes no progress, while HTTP/1.1 to the same host from the same machine
+# runs at full speed. pip speaks HTTP/1.1 and is unaffected.
+RUN --mount=type=cache,id=t2000-pip,target=/root/.cache/pip \
+    uv venv --seed --python /usr/local/bin/python /opt/t1000
+RUN --mount=type=cache,id=t2000-pip,target=/root/.cache/pip \
+    env -u PIP_NO_CACHE_DIR /opt/t1000/bin/python -m pip install \
        --index-url https://download.pytorch.org/whl/cu128 \
        'torch==2.8.0+cu128' 'torchaudio==2.8.0+cu128'
-RUN --mount=type=cache,id=t2000-uv,target=/root/.cache/uv \
-    uv pip install --python /opt/t1000/bin/python -r /tmp/t1000-worker.txt
+RUN --mount=type=cache,id=t2000-pip,target=/root/.cache/pip \
+    env -u PIP_NO_CACHE_DIR /opt/t1000/bin/python -m pip install -r /tmp/t1000-worker.txt
 
 FROM base AS runtime
 WORKDIR /app

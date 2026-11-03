@@ -91,6 +91,21 @@ Allow **40 GiB free** for the image, BuildKit caches and the model volume;
 five-minute timeouts, and BuildKit caches keep completed downloads so an
 interrupted build resumes rather than restarting.
 
+### If the build appears to hang on the Torch step
+
+uv's HTTP/2 client can stall indefinitely against `download.pytorch.org` through
+an inspecting corporate proxy: the process sleeps with its connections open and
+makes no progress, while HTTP/1.1 to the same host from the same machine runs at
+full speed. The CUDA install therefore uses pip, which speaks HTTP/1.1. If a
+step ever looks stuck, confirm it with CPU time rather than wall time:
+
+```sh
+docker buildx history ls                     # is the build still Running?
+docker system df                             # has Build Cache grown?
+```
+
+A step consuming almost no CPU over many minutes is blocked, not working.
+
 A rebuild is only needed when dependencies change. The studio source is
 installed editable against `/app/src`, so mounting the working tree makes code
 changes live on restart:

@@ -1,8 +1,19 @@
-# Isolated CUDA 12.8 worker environment for the self-contained image.
-# Matches the pinned dots.tts runtime. No bitsandbytes: the high-VRAM profile
-# keeps every language-model projection dense, so NF4 packing is never used.
-torch==2.8.0+cu128
-torchaudio==2.8.0+cu128
+# Synthesis dependencies for the pytorch/pytorch CUDA base image.
+#
+# torch, torchaudio, CUDA 12.8 and cuDNN 9 are deliberately ABSENT: they are
+# already in the base image. Re-declaring them here would make pip re-resolve
+# and re-download roughly 6 GB of CUDA wheels through the slow in-container
+# network path. dots.tts asks for torch>=2.8.0 and torchaudio>=2.8.0, which the
+# base image's 2.8.0+cu128 satisfies, so pip leaves them alone.
+#
+# bitsandbytes is also absent. It is only needed by the low-vram profile, which
+# quantizes the language model to NF4; the high-vram profile this image runs
+# keeps every projection dense in BF16.
+#
+# The pinned dots.tts revision brings its own dependency set (transformers,
+# librosa, soundfile, numpy, pydantic, PyYAML, safetensors, einops,
+# torchdiffeq, loguru, gradio, WeTextProcessing, lingua-language-detector).
+# The explicit pins below hold the versions this project validated against.
 dots.tts @ git+https://github.com/studio-dots-ai/dots.tts.git@b65ca7149fb43b8fb8d52916aa12738deda7b188
 transformers==4.57.0
 librosa==0.11.0
@@ -13,3 +24,8 @@ PyYAML==6.0.3
 safetensors==0.8.0rc0
 accelerate==1.15.0
 soxr==1.1.0
+
+# Parallel ranged downloads for the first-start model fetch. The weights are
+# 9.3 GB over a link that throttles single long-lived streams; hf_transfer
+# splits each file across many connections instead.
+hf-transfer==0.1.9

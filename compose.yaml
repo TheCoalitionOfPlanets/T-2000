@@ -1,12 +1,18 @@
 name: t2000
 
-# Self-contained T-1000 studio. One command brings it up on a CUDA GPU:
+# Self-contained T-1000 voice studio. On a machine with an NVIDIA GPU, Docker
+# Engine with the Compose plugin and the NVIDIA Container Toolkit:
 #
 #     docker compose up -d --build
+#     docker compose logs -f studio
 #
-# No host checkout, virtualenv or model download is needed first. The first
-# start fetches about 10 GB of pinned weights into the `models` volume and
-# verifies their SHA-256; later starts reuse them.
+# Nothing is prepared first: no host checkout, no virtualenv, no .env, no
+# manual model download. The first start fetches ~10 GB of pinned weights into
+# the `models` volume and verifies their SHA-256; later starts reuse them.
+#
+# Do not add --wait to the first run. The initial model fetch takes far longer
+# than Compose's health wait, and the container is legitimately not serving
+# until it finishes.
 
 services:
   studio:
@@ -19,23 +25,30 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${T2000_PORT:-7861}:7861"
+
     environment:
-      # SOAR is the higher-quality engine; MF2 is several times faster.
+      # t1000-mf2 (two sampling steps, fast) or t1000-soar (ten steps, higher
+      # quality). Switchable at runtime in the studio's engine selector.
       T2000_BACKEND: "${T2000_BACKEND:-t1000-mf2}"
-      # high-vram keeps the language model dense in BF16 and restores the
-      # upstream sequence limits. Use low-vram only on cards under ~8 GB,
-      # which also requires bitsandbytes in the worker environment.
+      # high-vram: dense BF16 language model and the upstream 2048/500 sequence
+      # limits. Correct for anything from roughly 8 GB of VRAM upward. low-vram
+      # additionally needs bitsandbytes, which this image does not install.
       T2000_T1000_PROFILE: "${T2000_T1000_PROFILE:-high-vram}"
       T2000_TTS_DEVICE: "${T2000_TTS_DEVICE:-cuda:0}"
       T2000_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
       OMP_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
       MKL_NUM_THREADS: "${T2000_NUM_THREADS:-8}"
       TORCHINDUCTOR_COMPILE_THREADS: "1"
+      # Set to 1 to start strictly offline against already-present models.
+      T2000_SKIP_MODEL_FETCH: "${T2000_SKIP_MODEL_FETCH:-0}"
+
     volumes:
-      # Weights, saved voices, recordings and generated WAVs. Named volumes so
-      # a fresh clone needs no host directories prepared in advance.
+      # Weights, saved voices, recordings and generated WAVs. A named volume
+      # lives on the VM's own filesystem; a Windows bind mount would push every
+      # model read through the 9p translation layer and cripple load times.
       - models:/app/data
       - cache:/app/.cache
+
     deploy:
       resources:
         reservations:
@@ -43,21 +56,35 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=2g,mode=1777
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
-    pids_limit: 512
+    pids_limit: 1024
     # Prompt latents and vocoder batches move through shared memory.
     shm_size: 1g
+
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     stop_grace_period: 45s
+
+networks:
+  default:
+    driver_opts:
+      # Container MTU must not exceed the host uplink's, or large transfers
+      # fragment and TCP collapses to a crawl while small requests look fine.
+      # A VPN interface commonly lowers the uplink to 1280 (Tailscale does),
+      # and Docker keeps defaulting containers to 1500. 1280 is the IPv6
+      # minimum, so it is universally routable and safe on a normal 1500 link
+      # too; the overhead is a fraction of a percent. Raise it with T2000_MTU
+      # if you know the whole path is 1500.
+      com.docker.network.driver.mtu: "${T2000_MTU:-1280}"
 
 volumes:
   models:

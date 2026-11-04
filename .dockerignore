@@ -1,6 +1,8 @@
-# Include only the application, vendored runtime and dependency manifests.
+# Include application sources and both deployment build recipes.
 **
 !Dockerfile
+!Dockerfile.bootstrap
+!Dockerfile.high-vram
 !docker-entrypoint.sh
 !pyproject.toml
 !README.md

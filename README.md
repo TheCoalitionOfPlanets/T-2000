@@ -31,29 +31,29 @@ See [the architecture and benchmark proposal](docs/architecture.md) for T-1000 r
 
 ## Start the studio
 
-On any machine with an NVIDIA GPU, Docker Engine with the Compose plugin, and the
-NVIDIA Container Toolkit:
+On the configured NVIDIA GPU server, start the Docker studio with one command:
 
 ```sh
-docker compose up -d --build
+./start.sh
 ```
 
-That is the whole setup. No host checkout of T-1000, no virtual environment and
-no manual model download: the image carries the studio and the pinned `dots.tts`
-runtime, and the first start fetches and verifies about 10 GB of weights into a
-named volume. Watch it with `docker compose logs -f studio`, then open
-**http://127.0.0.1:7861** on that machine, or forward port 7861 over SSH.
+Open **http://127.0.0.1:7861** on that machine, or forward port 7861 over SSH.
+The launcher also releases the native T-1000 studio's GPU before starting.
+See [Docker setup and operations](docs/docker.md) for the first setup, persistent
+data, all four voice engines, and stop/log commands.
 
-The image ships T-1000 SOAR and MF2 and defaults to the `high-vram` profile:
-a dense BF16 language model with the upstream sequence limits, sized for cards
-with roughly 8 GB of VRAM or more. On a 16 GB card it needs no tuning. Smaller
-cards can set `T2000_T1000_PROFILE=low-vram`, which quantizes the language model
-to NF4 and additionally needs bitsandbytes in the worker environment.
+For a fresh **16 GB NVIDIA GPU** machine, use the self-contained T-1000
+deployment instead:
 
-On the original 3050 laptop, `./start.sh` still reuses the installed image or
-its recovery archive and releases the native T-1000 studio's GPU first.
-See [Docker setup and operations](docs/docker.md) for profiles, the model
-provisioning step, persistent data, and stop/log commands.
+```sh
+./start.sh --high-vram
+# Windows: start.bat
+```
+
+It downloads pinned SOAR, MF2 and speech-recognition models into named volumes
+on first start. [High-VRAM Docker setup](docs/docker-high-vram.md) describes
+the separate image, configuration and first-start download. The default
+`./start.sh` continues to use the prepared 4 GB deployment.
 
 Use Python 3.11 and [uv](https://docs.astral.sh/uv/). From this directory:
 
@@ -92,13 +92,17 @@ F5 pretrained weights are licensed CC-BY-NC-4.0; its code is MIT. See the [model
 
 ## Use a voice
 
-1. Record or upload clean single-speaker speech up to **30 seconds**. Native sample rate is preserved. Browser microphone capture requests noise suppression and echo cancellation where supported. The saved reference must fit the selected engine: **1–12 seconds** for F5 (aim for **8–12 seconds**), **1–6 seconds** for T-1000, or **1–30 seconds** for Melo/OpenVoice.
+1. Record or upload clean single-speaker speech up to **30 seconds**. Native sample rate is preserved. Browser microphone capture requests noise suppression and echo cancellation where supported. The saved reference must fit the selected engine: **1–12 seconds** for F5 (aim for **8–12 seconds**), **1–6 seconds** for T-1000's low-VRAM profile (**1–10 seconds** for high-VRAM), or **1–30 seconds** for Melo/OpenVoice.
 2. Use **Clean up and trim** to choose start/end times, reduce background noise (on by default), or trim quiet edges automatically. Click **Preview changes**, listen, and compare with the original. Keep at least one second of speech and trim to the engine's limit; **Reset edits** restores the full recording and default cleanup settings. Suppression targets steady hiss and hum; competing voices, music and strong room echo may remain.
 3. Save the previewed reference. CPU STT runs by default; review and correct the exact words. F5 and T-1000 require the matching transcript. Automatic recognition preserves existing manual corrections, including corrections saved while recognition is running. Cropping clears draft words so the transcript can match the kept speech. Cleanup runs before analysis, transcription and voice conditioning. **Clean up or trim this voice** edits a saved reference as a new copy, keeping the previous voice and its cached conditioning available.
 4. Choose **Prepare voice for generation** to load models and cache conditioning before timing a request. The first Generate also prepares a voice when needed.
 5. Enter new English text and generate. Each complete phrase plays as it becomes available. With F5, **Reference pace** at 1.0× estimates pace from reference duration and transcript length; it does not reproduce the exact pitch or intonation contour. Stop clears playback and requests cancellation between model calls.
 
-Use **Voice engine** to compare the same recording and words. Installed T-1000 SOAR/MF2 reuse their existing runtime and accept complete 1–6 second references. They preserve native model delivery at 1.0×; the speed slider is disabled rather than applying a pitch or tempo effect. Switching unloads the previous engine before another loads, and is refused during generation. Fitting F5/T-1000 passages keep adjacent sentence context; longer text splits only when the engine budget requires it.
+Use **Voice engine** to compare the same recording and words. Installed T-1000 SOAR/MF2 accept complete 1–6 second references in the low-VRAM profile, or up to 10 seconds in the high-VRAM profile. They preserve native model delivery at 1.0×; the speed slider is disabled rather than applying a pitch or tempo effect. Switching unloads the previous engine before another loads, and is refused during generation. Fitting F5/T-1000 passages keep adjacent sentence context; longer text splits only when the engine budget requires it.
+
+**Pause between sentences** adds up to two seconds of silence between generated
+phrases in playback and WAV exports. The CLI exposes it as `--sentence-gap`;
+the generation API accepts `sentence_gap`. RTF excludes the inserted silence.
 
 The studio shows estimated first-audible latency, generation time, real-time factor (RTF), and playback gaps. **RTF below 1** means generation is faster than playback. Audible timing is estimated from browser rendering/device latency. Server generation timing excludes loading and enrollment, which are logged separately.
 
@@ -130,6 +134,8 @@ CLI and API enrollment enable background suppression by default; CLI `--no-noise
 | `T2000_F5_STEPS` | `32` | F5 sampling steps, 8–64. |
 | `T2000_T1000_ROOT` | `../T-1000` | Existing T-1000 checkout containing its verified models. |
 | `T2000_T1000_PYTHON` | `../T-1000/.venv/bin/python` | Existing isolated T-1000 interpreter; retain its environment path. |
+| `T2000_T1000_PROFILE` | `low-vram` | Quantized `low-vram` or dense BF16 `high-vram`; the 16 GB image selects `high-vram`. |
+| `T2000_T1000_RUNTIME_SOURCE` | `apps/api/src` under the T-1000 root | Runtime source directory containing `t1000/`; the self-contained image uses `/app/runtime`. |
 | `T2000_TTS_DEVICE` | `cpu` | F5 or Melo/BERT placement. |
 | `T2000_CONVERTER_DEVICE` | `cpu` | Converter/watermark placement; start with `cuda:0` on the 3050. |
 | `T2000_NUM_THREADS` | `4` | Torch and CPU STT thread setting. |

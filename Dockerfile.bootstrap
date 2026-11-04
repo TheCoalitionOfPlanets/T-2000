@@ -1,0 +1,75 @@
+# syntax=docker/dockerfile:1
+
+# Recovery build for this prepared Linux x86_64 / CPython 3.11 host. Supply ONLY
+# the two site-packages directories as named contexts; never whole environments,
+# home directories, project data, models, or configuration containing secrets.
+FROM python:3.11-slim-bookworm AS runtime
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=120 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=120 \
+       install -y --no-install-recommends ca-certificates ffmpeg libsndfile1 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 studio \
+    && useradd --uid 1000 --gid 1000 --create-home studio
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
+
+# Reuse the installed, validated manylinux wheels, including CUDA 12.1 Torch.
+COPY --from=melo-deps --chown=1000:1000 / /usr/local/lib/python3.11/site-packages/
+ENV PIP_DEFAULT_TIMEOUT=300 PIP_RETRIES=5
+WORKDIR /app
+COPY requirements/ ./requirements/
+RUN python -m venv --system-site-packages /opt/melo \
+    && python -m venv --system-site-packages /opt/f5 \
+    && python -m venv /opt/t1000
+# Copy only dependencies into the fresh, isolated T-1000 environment. Preserve
+# dots_tts-*.dist-info/direct_url.json for the worker's pinned-commit check.
+COPY --from=t1000-deps --chown=1000:1000 / /opt/t1000/lib/python3.11/site-packages/
+RUN python - <<'PY'
+from pathlib import Path
+import shutil
+
+root = Path('/usr/local/lib/python3.11/site-packages')
+(root / '_editable_impl_t2000.pth').unlink(missing_ok=True)
+for metadata in root.glob('t2000-*.dist-info'):
+    shutil.rmtree(metadata)
+
+root = Path('/opt/t1000/lib/python3.11/site-packages')
+for pattern in ('__editable__*t1000*.pth', '__editable__*t1000*.py', 't1000_api-*.dist-info'):
+    for path in root.glob(pattern):
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+PY
+RUN sed '/^torch @ /d; /^torchaudio @ /d' requirements/inference-f5.txt > requirements/f5-container.txt
+# Only the small F5-specific packages and version overrides are fetched. Its
+# existing Torch/torchaudio and CUDA libraries remain shared with Melo.
+RUN --mount=type=cache,id=t2000-bootstrap-pip,target=/root/.cache/pip \
+    env -u PIP_NO_CACHE_DIR /opt/f5/bin/python -m pip install -r requirements/f5-container.txt
+COPY --chown=1000:1000 pyproject.toml README.md ./
+COPY --chown=1000:1000 src/ ./src/
+COPY --chown=1000:1000 scripts/ ./scripts/
+RUN --mount=type=cache,id=t2000-bootstrap-pip,target=/root/.cache/pip \
+    env -u PIP_NO_CACHE_DIR /opt/melo/bin/python -m pip install --no-deps -e .
+
+RUN mkdir -p /app/data /app/.cache \
+    && chown -R 1000:1000 /app/data /app/.cache
+ENV PATH="/opt/melo/bin:$PATH" \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/app/.cache \
+    HF_HOME=/app/.cache/huggingface \
+    NUMBA_CACHE_DIR=/app/.cache/numba \
+    MPLCONFIGDIR=/app/.cache/matplotlib \
+    T2000_DATA_DIR=/app/data \
+    T2000_MODEL_DIR=/app/data/models \
+    T2000_F5_PYTHON=/opt/f5/bin/python \
+    T2000_T1000_ROOT=/t1000 \
+    T2000_T1000_PYTHON=/opt/t1000/bin/python \
+    T2000_TTS_DEVICE=cuda:0 \
+    T2000_CONVERTER_DEVICE=cuda:0 \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+    NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+USER 1000:1000
+EXPOSE 7861
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["/opt/melo/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7861/api/status', timeout=5).read()"]
+ENTRYPOINT ["/opt/melo/bin/t2000"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "7861"]

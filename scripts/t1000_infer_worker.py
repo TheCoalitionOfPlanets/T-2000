@@ -24,6 +24,11 @@ PINS = {
             "5022f36ee599f037efc2869e351bfe2bb627573e05b45d5b1c99437bc674351a"),
 }
 RUNTIME_REVISION = "b65ca7149fb43b8fb8d52916aa12738deda7b188"
+PROFILE_SOURCES = {
+    "low-vram": ("low_vram.py", "references.py", "eager.py", "vocoder.py"),
+    "high-vram": ("high_vram.py", "references.py", "eager.py", "vocoder.py"),
+}
+PROFILE_REFERENCE_SECONDS = {"low-vram": 6, "high-vram": 10}
 
 
 def sha256(path):
@@ -87,9 +92,10 @@ class DecodeObserver:
 class Runtime:
     def __init__(self, root, model, device, num_threads, profile="low-vram", runtime_source=None):
         self.root = Path(root).expanduser().resolve()
-        if profile not in {"low-vram", "high-vram"}:
+        if profile not in PROFILE_SOURCES:
             raise ValueError("T-1000 profile must be low-vram or high-vram.")
         self.profile = profile
+        self.max_reference_seconds = PROFILE_REFERENCE_SECONDS[profile]
         # Vendored runtime, or the legacy external T-1000 checkout layout.
         self.runtime_source = (Path(runtime_source).expanduser().resolve()
                                if runtime_source else self.root / "apps/api/src")
@@ -106,7 +112,7 @@ class Runtime:
                           T1000_TTS_VOCODER_BATCH_SIZE="4", T1000_TTS_EAGER_CACHE="1",
                           T1000_TTS_COMPILE_VOCODER="0", T1000_ROOT=str(self.root))
         source = self.runtime_source
-        entry = "high_vram.py" if self.profile == "high-vram" else "low_vram.py"
+        entry = PROFILE_SOURCES[self.profile][0]
         if not (source / "t1000" / entry).is_file():
             raise ValueError(f"The T-1000 runtime source is missing {entry}.")
         sys.path.insert(0, str(source))
@@ -166,8 +172,8 @@ class Runtime:
             "model": self.model_name, "model_dir": str(self.model_path), "model_revision": PINS[self.model_name][1],
             "files_sha256": files, "dots_runtime_revision": RUNTIME_REVISION, "versions": versions,
             "runtime_source_sha256": sha256(installed_runtime.__file__),
-            "t1000_source_sha256": {name: sha256(self.root / "apps/api/src/t1000" / name) for name in
-                                     ("low_vram.py", "references.py", "eager.py", "vocoder.py")},
+            "t1000_source_sha256": {name: sha256(self.runtime_source / "t1000" / name)
+                                     for name in PROFILE_SOURCES[self.profile]},
             "precision": ("BF16 acoustic core; FP32 speaker encoder/vocoder; BF16 language model"
                           if self.profile == "high-vram" else
                           "BF16 acoustic core; FP32 speaker encoder/vocoder; NF4 language-model blocks"),
@@ -186,8 +192,10 @@ class Runtime:
         request = validate_request(request, generation=False)
         self.load()
         with self.sf.SoundFile(request["reference_path"]) as recording:
-            if not 1 <= recording.frames / recording.samplerate <= 6 or not 1 <= recording.channels <= 8:
-                raise ValueError("Use a complete 1–6 second reference with its exact transcript.")
+            if (not 1 <= recording.frames / recording.samplerate <= self.max_reference_seconds
+                    or not 1 <= recording.channels <= 8):
+                raise ValueError(f"Use a complete 1–{self.max_reference_seconds} second reference "
+                                 "with its exact transcript.")
             samples = recording.read(dtype="float32", always_2d=True)
         if not self.np.isfinite(samples).all() or not samples.size or not self.np.any(samples):
             raise ValueError("Reference audio is empty, silent or non-finite.")

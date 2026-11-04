@@ -1,140 +1,136 @@
-# Docker: self-contained T-1000 studio
+# Docker on the GPU host
 
-One command on a machine with an NVIDIA GPU, Docker Engine with the Compose
-plugin, and the NVIDIA Container Toolkit:
+This is the prepared 4 GB deployment and remains the default. For a fresh
+16 GB GPU machine, see the separate [self-contained deployment](docker-high-vram.md).
 
-```sh
-docker compose up -d --build
-```
+The Docker studio includes isolated Melo/OpenVoice, F5, and T-1000 workers. Melo
+and F5 share the pinned Torch 2.5.1 CUDA 12.1 libraries; T-1000 has its own Torch
+2.8.0 CUDA 12.8 environment. The build includes code and dependencies, while
+models, recorded references, and generated audio stay on the host.
 
-Nothing else is prepared first. No host checkout of T-1000, no virtual
-environment, no manual model download, and no `.env`. The studio answers on
-<http://127.0.0.1:7861>.
+Use Linux x86_64, Docker Engine with the Compose plugin, and the NVIDIA Container
+Toolkit configured for Docker. GPU access uses Docker's
+[Compose device reservation](https://docs.docker.com/compose/how-tos/gpu-support/).
+The first full build needs Internet access and substantial temporary disk space;
+allow **60 GiB free** beyond the existing models for the full image,
+dependency caches, temporary layers, and image export/loading. Later starts
+reuse the installed image.
+The launcher checks this free-space requirement before a full build and leaves
+the running studios alone if there is not enough space. It does not apply to
+normal startup using the installed image or the recovery archive.
+The build selects CUDA wheels and their dependencies through the official
+[PyTorch indexes](https://pytorch.org/get-started/previous-versions/), uses
+five-minute HTTP timeouts, and keeps completed downloads in BuildKit caches so
+an interrupted install can reuse them. These download caches are outside the
+runtime image and can be reclaimed after the image is verified.
 
-## What the image contains
+The configured SSH server keeps T-2000 at `/home/prieyan/weeb/T-2000`.
+From the T-2000 directory, copy `.env.docker.example` to `.env`. Set
+`T2000_T1000_HOST_ROOT` to the existing T-1000 checkout on the Docker host, for
+example `/home/prieyan/weeb/T-1000`. Its `apps/api/src/t1000` source and verified
+`data/models/dots.tts-soar` and `data/models/dots.tts-mf-2steps` models are mounted
+read-only. Only those source and model directories enter the container; the
+T-1000 Git repository and native environment stay outside it. The image runs as
+UID/GID **1000:1000**, matching the configured server and its `data` directory.
+Moving to a host with different ownership requires adapting the image's user
+and file ownership before building it.
 
-The image ships **T-1000 SOAR and MF2 only**, and carries a single CUDA stack:
+Keep the prepared T-2000 models in `data/models`, including the synthesis
+manifests, source bundles, and Nemotron recognition model. Docker startup does
+not redownload or replace models. On a fresh machine, first prepare or transfer
+them as described in [model setup](models.md) and the README's F5 instructions.
 
-| Environment | Contents |
-|---|---|
-| `/opt/app` | The studio: FastAPI, audio I/O, CPU speech recognition. **No Torch.** |
-| `/opt/t1000` | Synthesis: Torch 2.8.0+cu128 and the pinned `dots.tts` runtime |
-| `/app/runtime/t1000` | The vendored low/high-VRAM loaders, prompt cache and vocoder batching |
-
-The studio process itself never imports Torch; synthesis runs in the isolated
-`/opt/t1000` environment behind a JSON-lines worker. That is why one CUDA build
-is enough.
-
-The `dots.tts` package installs from its pinned upstream commit, and the
-vendored loaders live in `runtime/t1000/`. The adapter hashes those four files
-into the backend signature, so a change to them invalidates a loaded model
-rather than silently altering synthesis.
-
-## First start
-
-Weights are not baked into the image. The entrypoint provisions them into the
-`models` volume on first start and verifies each one:
-
-| Resource | Size | Source |
-|---|---|---|
-| `dots.tts-soar` | 5.2 GB | `dots-studio/dots.tts-soar`, pinned revision, Apache-2.0 |
-| `dots.tts-mf-2steps` | 4.1 GB | `dots-studio/dots.tts-mf-2steps`, pinned revision, Apache-2.0 |
-| Nemotron INT8 speech recognition | 630 MB | pinned `sherpa-onnx` release asset |
-
-The checkpoint SHA-256 is checked against the same pins the backend enforces at
-load time; a mismatch aborts rather than running an unverified model. Expect
-roughly 10 GB of download once. Follow it with:
+Start the studio with one command:
 
 ```sh
-docker compose logs -f studio
+./start.sh
 ```
 
-Completed directories are detected and skipped, so restarts and image rebuilds
-never re-download. The health check allows a 45-minute start period to cover the
-first fetch. To start strictly offline against what is already present, set
-`T2000_SKIP_MODEL_FETCH=1`.
+This validates the configuration, uses the installed image, restores it from
+`.cache/t2000-gpu.tar` if missing, or builds it if neither is available. It then
+stops the existing `t2000.service` and
+`t1000-3050.service` user services if installed, and starts the Docker studio. It
+waits for the HTTP health check and prints the address. The models load when a
+voice is first prepared or speech is requested. The initial engine is T-1000 MF2;
+the studio selector still offers all four installed engines.
 
-## VRAM profiles
+Only run one studio's synthesis on the 4 GB GPU at a time. The launch script
+switches away from the native T-1000 studio to avoid retaining both models in
+VRAM. Starting T-1000 should stop this container first. Docker restarts T-2000
+after a reboot, with no synthesis model preloaded. Normal starts use the local
+image and do not contact image registries. After changing application code or
+dependencies, explicitly rebuild with `./start.sh --build`.
 
-`T2000_T1000_PROFILE` selects how the language model is loaded. The default is
-`high-vram`.
+The configured server keeps `.cache/t2000-gpu.tar` as an intentional offline
+recovery backup. Keep it when cleaning disposable caches: it allows `./start.sh`
+to recover if a later Docker cleanup removes the stopped image. Existing images
+are used as they are; the backup is loaded only when `t2000:gpu` is absent. The
+archive contains application dependencies and code. Models, voice profiles,
+recordings, and generated WAVs remain separate under the host data directories.
 
-| | `high-vram` (default) | `low-vram` |
-|---|---|---|
-| Language-model weights | dense BF16 | NF4 via bitsandbytes |
-| `max_sequence_length` | 2048 (upstream) | 512 |
-| `max_generate_length` | 500 patches (~80 s) | 128 patches (~20.5 s) |
-| Reference limit | 10 s | 6 s |
-| Needs bitsandbytes | no | yes |
-
-`high-vram` removes the per-matmul NF4 dequantization from autoregressive
-decoding, which is the dominant cost in the quantized profile. Restoring the
-upstream sequence budget lets one request hold a longer reference and speak a
-longer passage, so the delivery planner splits text into fewer phrases and the
-reference is re-prefilled fewer times.
-
-The reference limit rises to 10 s because that is the model's own ceiling:
-`config.json` sets `xvec_max_audio_seconds: 10.0`, and beyond it the speaker
-encoder takes a **random** crop and stops caching the embedding. A longer clip
-would make identity vary with the seed instead of improving it.
-
-The default image does not install bitsandbytes, so `low-vram` needs
-`requirements/t1000-worker.txt` in the worker environment instead of
-`requirements/t1000-worker-cuda.txt`.
-
-## Disk and build
-
-The build needs Internet access and temporary space for one CUDA wheel set.
-Allow **40 GiB free** for the image, BuildKit caches and the model volume;
-`start.sh` checks this before a full build. CUDA wheels come from the official
-[PyTorch index](https://pytorch.org/get-started/previous-versions/) with
-five-minute timeouts, and BuildKit caches keep completed downloads so an
-interrupted build resumes rather than restarting.
-
-### If the build appears to hang on the Torch step
-
-uv's HTTP/2 client can stall indefinitely against `download.pytorch.org` through
-an inspecting corporate proxy: the process sleeps with its connections open and
-makes no progress, while HTTP/1.1 to the same host from the same machine runs at
-full speed. The CUDA install therefore uses pip, which speaks HTTP/1.1. If a
-step ever looks stuck, confirm it with CPU time rather than wall time:
+The equivalent Compose command is:
 
 ```sh
-docker buildx history ls                     # is the build still Running?
-docker system df                             # has Build Cache grown?
+docker compose up -d --build --wait
 ```
 
-A step consuming almost no CPU over many minutes is blocked, not working.
-
-A rebuild is only needed when dependencies change. The studio source is
-installed editable against `/app/src`, so mounting the working tree makes code
-changes live on restart:
-
-```yaml
-    volumes:
-      - type: bind
-        source: ./src
-        target: /app/src
-        read_only: true
-```
-
-## Data and hardening
-
-`models:/app/data` holds weights, saved voices, recordings and generated WAVs;
-`cache:/app/.cache` holds the Hugging Face and numba caches. Both are named
-volumes, so a fresh clone needs no host directories prepared. The container runs
-read-only as UID 1000 with all capabilities dropped, `no-new-privileges`, a
-512-process limit, a 2 GB tmpfs on `/tmp`, and the port published only on
-loopback.
-
-## Overrides
-
-Copy `.env.docker.example` to `.env` to change the port, engine, profile, device
-or thread count. Every value has a working default.
+Use `./start.sh` on the shared GPU host because it also releases the native
+studios' GPU allocations. To stop or inspect the container:
 
 ```sh
-docker compose up -d                 # start, reusing the built image
-docker compose logs -f studio        # watch the first model fetch
-docker compose restart studio        # pick up source changes when src is mounted
-docker compose down                  # stop; volumes and models persist
+docker compose stop studio
+docker compose ps
+docker compose logs --tail=100 studio
+docker compose exec studio /opt/melo/bin/t2000 doctor
 ```
+
+The app binds to `0.0.0.0` inside the container and publishes to host loopback
+only. On the GPU laptop, open **http://127.0.0.1:7861**. From another machine:
+
+```sh
+ssh -N -L 7861:127.0.0.1:7861 prieyan@10.10.1.164
+```
+
+Then open **http://127.0.0.1:7861** locally. Microphone capture works through this
+localhost connection. `T2000_PORT` in `.env` can change the published host port.
+
+The container runs without root, with a read-only application filesystem and
+writable persistent `./data` plus a named compiler/cache volume. Logs rotate at
+30 MB. Removing/rebuilding the container preserves the host data. Models and
+recordings never enter the Docker build context. Keep the native environments
+until the Docker deployment has passed real synthesis checks.
+
+## Bootstrap build recorded during setup
+
+`Dockerfile.bootstrap` can reuse the already installed CPython 3.11 manylinux
+dependencies on the configured x86_64 host. The regular `Dockerfile` remains the
+installation route for a fresh machine. The recovery build copies dependency
+files through two explicit named contexts, creates new container interpreters
+and entrypoints, and installs only the missing F5 dependencies. It preserves the
+T-1000 worker's pinned upstream commit metadata. Host interpreter paths, native
+launch scripts, project models, recordings, and secrets are excluded.
+
+The command below records the bootstrap used during setup, from the original
+`/home/prieyan/T-2000` location. The checkout has since moved to
+`/home/prieyan/weeb/T-2000`, and its native `.venv` has been removed after Docker
+verification. Current offline recovery uses `cd ~/weeb/T-2000 && ./start.sh`,
+which restores `.cache/t2000-gpu.tar` when the installed image is missing.
+Repeating a bootstrap build requires the dependency directories in its named
+contexts to exist.
+
+Original bootstrap command:
+
+```sh
+docker buildx build -f Dockerfile.bootstrap -t t2000:gpu \
+  --build-context melo-deps=/home/prieyan/T-2000/.venv/lib/python3.11/site-packages \
+  --build-context t1000-deps=/home/prieyan/weeb/T-1000/.venv/lib/python3.11/site-packages \
+  --output type=docker,dest=/home/prieyan/.local/state/tprojects-maintenance/2026-11-02/t2000-gpu.tar \
+  .
+docker load -i /home/prieyan/.local/state/tprojects-maintenance/2026-11-02/t2000-gpu.tar
+mkdir -p .cache
+mv /home/prieyan/.local/state/tprojects-maintenance/2026-11-02/t2000-gpu.tar .cache/t2000-gpu.tar
+./start.sh
+```
+
+Verify actual CUDA imports and speech generation for all engines after loading;
+reuse of host dependencies alone does not establish container compatibility.

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import select
+import signal
 import subprocess
 import tempfile
 import threading
@@ -111,6 +112,35 @@ class F5Backend:
     def signature(self):
         return hashlib.sha256(json.dumps(self._identity(), sort_keys=True).encode()).hexdigest()
 
+    def _diagnostics(self):
+        """Why the worker died: its exit status and the tail of its stderr.
+
+        Read before close() discards the capture file, so an out-of-memory kill
+        is reported as one instead of as a transport error.
+        """
+        details = []
+        status = None if self._process is None else self._process.poll()
+        if status is not None and status < 0:
+            try:
+                name = signal.Signals(-status).name
+            except ValueError:
+                name = f"signal {-status}"
+            details.append(f"the worker was killed by {name}" + (
+                "; the host ran out of memory loading the model" if -status == signal.SIGKILL else ""))
+        elif status:
+            details.append(f"the worker exited with status {status}")
+        if self._stderr is not None:
+            try:
+                size = self._stderr.seek(0, os.SEEK_END)
+                self._stderr.seek(max(0, size - 8192))
+                tail = self._stderr.read().decode("utf-8", "replace")
+            except (OSError, ValueError):
+                tail = ""
+            lines = [line.strip() for line in tail.splitlines() if line.strip()][-3:]
+            if lines:
+                details.append("worker output: " + " | ".join(lines))
+        return "; ".join(details)
+
     def _exchange(self, request, timeout=600):
         if self._process is None or self._process.poll() is not None:
             raise T2000Error("The F5 worker stopped. Prepare the voice again or restart the studio.")
@@ -144,8 +174,10 @@ class F5Backend:
         except T2000Error:
             raise
         except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+            details = self._diagnostics()
             self.close()
-            raise T2000Error(f"F5 generation failed: {exc}.") from exc
+            raise T2000Error(f"F5 generation failed: {exc}"
+                             + (f" ({details})" if details else "") + ".") from exc
 
     def load(self):
         with self._lock:
@@ -166,8 +198,10 @@ class F5Backend:
                 self._exchange({"command": "load"})
                 self._loaded_signature = signature
             except OSError as exc:
+                details = self._diagnostics()
                 self.close()
-                raise T2000Error(f"Could not start the isolated F5 worker: {exc}.") from exc
+                raise T2000Error(f"Could not start the isolated F5 worker: {exc}"
+                                 + (f" ({details})" if details else "") + ".") from exc
             except BaseException:
                 self.close()
                 raise
@@ -280,7 +314,12 @@ class F5Backend:
                             process.wait(timeout=10)
                 for stream in (process.stdin, process.stdout):
                     if stream:
-                        stream.close()
+                        # A failed flush leaves the data buffered, so closing raises
+                        # the same BrokenPipeError and would mask the real error.
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
             if self._stderr is not None:
                 self._stderr.close()
                 self._stderr = None

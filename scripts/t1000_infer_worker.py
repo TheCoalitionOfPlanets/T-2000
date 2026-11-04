@@ -24,6 +24,11 @@ PINS = {
             "5022f36ee599f037efc2869e351bfe2bb627573e05b45d5b1c99437bc674351a"),
 }
 RUNTIME_REVISION = "b65ca7149fb43b8fb8d52916aa12738deda7b188"
+PROFILE_SOURCES = {
+    "low-vram": ("low_vram.py", "references.py", "eager.py", "vocoder.py"),
+    "high-vram": ("high_vram.py", "references.py", "eager.py", "vocoder.py"),
+}
+PROFILE_REFERENCE_SECONDS = {"low-vram": 6, "high-vram": 10}
 
 
 def sha256(path):
@@ -85,8 +90,15 @@ class DecodeObserver:
 
 
 class Runtime:
-    def __init__(self, root, model, device, num_threads):
+    def __init__(self, root, model, device, num_threads, profile="low-vram", runtime_source=None):
         self.root = Path(root).expanduser().resolve()
+        if profile not in PROFILE_SOURCES:
+            raise ValueError("T-1000 profile must be low-vram or high-vram.")
+        self.profile = profile
+        self.max_reference_seconds = PROFILE_REFERENCE_SECONDS[profile]
+        # Vendored runtime, or the legacy external T-1000 checkout layout.
+        self.runtime_source = (Path(runtime_source).expanduser().resolve()
+                               if runtime_source else self.root / "apps/api/src")
         self.model_name, self.device, self.num_threads = model, device, num_threads
         self.model_path = self.root / "data/models" / PINS[model][0]
         self.loaded = False
@@ -96,12 +108,13 @@ class Runtime:
     def imports(self):
         sys.dont_write_bytecode = True  # Reuse the existing checkout without writing import caches into it.
         os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", TOKENIZERS_PARALLELISM="false",
-                          T1000_REFERENCE_TRIM="0", T1000_TTS_PROFILE="low-vram", T1000_TTS_OPTIMIZE="0",
+                          T1000_REFERENCE_TRIM="0", T1000_TTS_PROFILE=self.profile, T1000_TTS_OPTIMIZE="0",
                           T1000_TTS_VOCODER_BATCH_SIZE="4", T1000_TTS_EAGER_CACHE="1",
                           T1000_TTS_COMPILE_VOCODER="0", T1000_ROOT=str(self.root))
-        source = self.root / "apps/api/src"
-        if not (source / "t1000/low_vram.py").is_file():
-            raise ValueError("The existing T-1000 source checkout is missing.")
+        source = self.runtime_source
+        entry = PROFILE_SOURCES[self.profile][0]
+        if not (source / "t1000" / entry).is_file():
+            raise ValueError(f"The T-1000 runtime source is missing {entry}.")
         sys.path.insert(0, str(source))
         direct_url = json.loads(metadata.distribution("dots-tts").read_text("direct_url.json") or "{}")
         if direct_url.get("vcs_info", {}).get("commit_id") != RUNTIME_REVISION:
@@ -111,16 +124,22 @@ class Runtime:
         import torch
         from dots_tts.utils.util import seed_everything
         from t1000.eager import configure_eager_cache
-        from t1000.low_vram import load_low_vram_runtime
         from t1000.references import configure_prompt_audio
+
+        if self.profile == "high-vram":
+            from t1000.high_vram import load_high_vram_runtime as load_runtime
+        else:
+            from t1000.low_vram import load_low_vram_runtime as load_runtime
 
         self.np, self.sf, self.torch = np, sf, torch
         self.seed_everything = seed_everything
-        self.load_runtime = load_low_vram_runtime
+        self.load_runtime = load_runtime
         self.configure_prompt = configure_prompt_audio
         self.configure_cache = configure_eager_cache
-        return {name: metadata.version(name) for name in
-                ("torch", "torchaudio", "dots-tts", "bitsandbytes", "accelerate", "numpy", "soundfile")}
+        names = ["torch", "torchaudio", "dots-tts", "accelerate", "numpy", "soundfile"]
+        if self.profile == "low-vram":
+            names.append("bitsandbytes")
+        return {name: metadata.version(name) for name in names}
 
     def load(self):
         if self.loaded:
@@ -153,9 +172,14 @@ class Runtime:
             "model": self.model_name, "model_dir": str(self.model_path), "model_revision": PINS[self.model_name][1],
             "files_sha256": files, "dots_runtime_revision": RUNTIME_REVISION, "versions": versions,
             "runtime_source_sha256": sha256(installed_runtime.__file__),
-            "t1000_source_sha256": {name: sha256(self.root / "apps/api/src/t1000" / name) for name in
-                                     ("low_vram.py", "references.py", "eager.py", "vocoder.py")},
-            "precision": "BF16 acoustic core; FP32 speaker encoder/vocoder; NF4 language-model blocks",
+            "t1000_source_sha256": {name: sha256(self.runtime_source / "t1000" / name)
+                                     for name in PROFILE_SOURCES[self.profile]},
+            "precision": ("BF16 acoustic core; FP32 speaker encoder/vocoder; BF16 language model"
+                          if self.profile == "high-vram" else
+                          "BF16 acoustic core; FP32 speaker encoder/vocoder; NF4 language-model blocks"),
+            "profile": self.profile,
+            "max_generate_length": self.runtime.max_generate_length,
+            "max_sequence_length": self.runtime.max_sequence_length,
             "reference_processing": "Whole mono prompt, no trimming or gain changes; T-1000 HQ resampling",
             "sampling": {"num_steps": 10, "guidance_scale": 1.2, "ode_method": "euler"}
                         if self.model_name == "soar" else config["sampling"],
@@ -168,8 +192,10 @@ class Runtime:
         request = validate_request(request, generation=False)
         self.load()
         with self.sf.SoundFile(request["reference_path"]) as recording:
-            if not 1 <= recording.frames / recording.samplerate <= 6 or not 1 <= recording.channels <= 8:
-                raise ValueError("Use a complete 1–6 second reference with its exact transcript.")
+            if (not 1 <= recording.frames / recording.samplerate <= self.max_reference_seconds
+                    or not 1 <= recording.channels <= 8):
+                raise ValueError(f"Use a complete 1–{self.max_reference_seconds} second reference "
+                                 "with its exact transcript.")
             samples = recording.read(dtype="float32", always_2d=True)
         if not self.np.isfinite(samples).all() or not samples.size or not self.np.any(samples):
             raise ValueError("Reference audio is empty, silent or non-finite.")
@@ -260,11 +286,16 @@ def main():
     parser.add_argument("--model", choices=PINS, default="soar")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument("--profile", choices=("low-vram", "high-vram"), default="low-vram",
+                        help="high-vram keeps the language model dense and restores upstream limits.")
+    parser.add_argument("--runtime-source", type=Path, default=None,
+                        help="Directory containing the t1000 package; defaults to <root>/apps/api/src.")
     parser.add_argument("--check-imports", action="store_true", help="CPU-only imports; no model load")
     args = parser.parse_args()
     if not 1 <= args.num_threads <= 32:
         parser.error("Use between 1 and 32 CPU threads.")
-    runtime = Runtime(args.t1000_root, args.model, args.device, args.num_threads)
+    runtime = Runtime(args.t1000_root, args.model, args.device, args.num_threads,
+                      profile=args.profile, runtime_source=args.runtime_source)
     if args.check_imports:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         with contextlib.redirect_stdout(sys.stderr):

@@ -1,5 +1,8 @@
 # Docker on the GPU host
 
+This is the prepared 4 GB deployment and remains the default. For a fresh
+16 GB GPU machine, see the separate [self-contained deployment](docker-high-vram.md).
+
 The Docker studio includes isolated Melo/OpenVoice, F5, and T-1000 workers. Melo
 and F5 share the pinned Torch 2.5.1 CUDA 12.1 libraries; T-1000 has its own Torch
 2.8.0 CUDA 12.8 environment. The build includes code and dependencies, while

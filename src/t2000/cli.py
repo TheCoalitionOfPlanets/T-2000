@@ -30,6 +30,8 @@ def main():
     generate.add_argument("--text", required=True)
     generate.add_argument("--speed", type=float, default=1.0)
     generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument("--sentence-gap", type=float, default=0.0,
+                          help="Silence inserted between sentences, in seconds.")
     sub.add_parser("doctor", help="Report runtime/model availability without loading weights")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -76,7 +78,8 @@ def main():
                 engine.prepare_profile(profile["id"])
             print(json.dumps(profile, indent=2))
         elif args.command == "generate":
-            print(json.dumps(engine.generate(args.profile, args.text, speed=args.speed, seed=args.seed), indent=2))
+            print(json.dumps(engine.generate(args.profile, args.text, speed=args.speed, seed=args.seed,
+                                              sentence_gap=args.sentence_gap), indent=2))
     except (T2000Error, OSError, ValueError) as exc:
         parser.exit(1, f"T-2000: {exc}\n")
 

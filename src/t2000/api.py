@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Settings
 from .audio import prepare_reference
-from .engine import Cancelled, Engine
+from .engine import MAX_SENTENCE_GAP, Cancelled, Engine
 from .errors import T2000Error
 from .profiles import ProfileStore
 
@@ -29,6 +29,7 @@ class GenerationRequest(BaseModel):
     text: str = Field(min_length=1, max_length=3000)
     speed: float = Field(default=1.0, ge=0.7, le=1.4, allow_inf_nan=False)
     seed: int = Field(default=42, ge=0, le=0xFFFFFFFF, strict=True)
+    sentence_gap: float = Field(default=0.0, ge=0, le=MAX_SENTENCE_GAP, allow_inf_nan=False)
 
 
 class TranscriptUpdate(BaseModel):

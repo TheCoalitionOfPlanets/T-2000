@@ -1,7 +1,9 @@
-# Include only the application and dependency manifests in the build context.
+# Include application sources and both deployment build recipes.
 **
 !Dockerfile
 !Dockerfile.bootstrap
+!Dockerfile.high-vram
+!docker-entrypoint.sh
 !pyproject.toml
 !README.md
 !requirements/
@@ -10,6 +12,8 @@
 !src/**
 !scripts/
 !scripts/**
+!runtime/
+!runtime/**
 **/__pycache__/
 **/*.py[cod]
 **/.DS_Store

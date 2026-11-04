@@ -20,6 +20,9 @@ from .text import split_phrases
 
 logger = logging.getLogger(__name__)
 
+# Longest silence the studio will insert between sentences, in seconds.
+MAX_SENTENCE_GAP = 2.0
+
 
 class Cancelled(T2000Error):
     pass
@@ -45,6 +48,8 @@ class Engine:
                     t1000_root=self.settings.t1000_root,
                     model="soar" if self.settings.backend == "t1000-soar" else "mf2",
                     device=self.settings.tts_device, num_threads=self.settings.num_threads,
+                    profile=self.settings.t1000_profile,
+                    runtime_source=self.settings.t1000_runtime_source,
                 )
                 return self._backend
             if self.settings.backend == "f5-tts-v1":
@@ -101,7 +106,11 @@ class Engine:
 
     @property
     def max_reference_seconds(self) -> int:
-        return {"f5-tts-v1": 12, "t1000-soar": 6, "t1000-mf2": 6}.get(self.settings.backend, 30)
+        if self.settings.backend.startswith("t1000-"):
+            from .backends.t1000 import PROFILE_REFERENCE_SECONDS
+
+            return PROFILE_REFERENCE_SECONDS[self.settings.t1000_profile]
+        return 12 if self.settings.backend == "f5-tts-v1" else 30
 
     def available_backends(self) -> list[dict]:
         root = self.settings.model_dir
@@ -224,6 +233,7 @@ class Engine:
 
     def generate(
         self, profile_id: str, text: str, *, speed: float = 1.0, seed: int = 42,
+        sentence_gap: float = 0.0,
         emit: Callable[[dict], None] = lambda _: None, cancel: threading.Event | None = None,
     ) -> dict:
         """One serialized request. Emits metadata then little-endian float32 PCM.
@@ -238,6 +248,9 @@ class Engine:
             raise T2000Error("Speed must be between 0.7 and 1.4.")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 0xFFFFFFFF:
             raise T2000Error("Seed must be between 0 and 4294967295.")
+        if (isinstance(sentence_gap, bool) or not isinstance(sentence_gap, (int, float))
+                or not math.isfinite(sentence_gap) or not 0 <= sentence_gap <= MAX_SENTENCE_GAP):
+            raise T2000Error(f"Sentence pause must be between 0 and {MAX_SENTENCE_GAP} seconds.")
         if not text.strip():
             raise T2000Error("Enter text to speak.")
         phrases = (split_phrases(text, self.settings.phrase_chars)
@@ -275,6 +288,7 @@ class Engine:
             base_seconds = conversion_seconds = 0.0
             peak = 0.0
             clipped_samples = 0
+            silence_frames = 0
             audio_file = None
             try:
                 for index, phrase in enumerate(phrases):
@@ -295,6 +309,24 @@ class Engine:
                         raise T2000Error("The model produced silent audio.")
                     peak = max(peak, chunk_peak)
                     clipped_samples += int(np.count_nonzero(np.abs(pcm) >= 1.0))
+                    if index and sentence_gap:
+                        pause = np.zeros(round(sentence_gap * rate), dtype=np.float32)
+                        if pause.size:
+                            if (frames + pause.size + pcm.size) / rate > self.settings.max_output_seconds:
+                                raise T2000Error("Generated audio exceeded the 120-second limit. "
+                                                 "Use shorter text or a shorter sentence pause.")
+                            if audio_file is None:
+                                audio_file = sf.SoundFile(temporary, mode="w", samplerate=rate, channels=1,
+                                                          format="WAV", subtype="PCM_16")
+                            audio_file.write(pause)
+                            frames += pause.size
+                            silence_frames += pause.size
+                            for offset in range(0, pause.size, max(1, rate // 10)):
+                                self._check(cancel)
+                                packet = pause[offset:offset + rate // 10].astype("<f4", copy=False)
+                                emit({"type": "audio", "sample_rate": rate, "frames": packet.size,
+                                      "sequence": sequence, "pcm": packet.tobytes()})
+                                sequence += 1
                     now = time.perf_counter()
                     if first_pcm is None:
                         first_pcm = now - started
@@ -325,11 +357,14 @@ class Engine:
                     audio_file.close()
             self._check(cancel)
             audio_seconds = frames / sample_rate
+            spoken_seconds = (frames - silence_frames) / sample_rate
             metrics = {
                 "queue_seconds": queue_seconds, "load_seconds": load_seconds,
                 "prepare_seconds": prepare_seconds, "generation_seconds": generation_seconds,
                 "first_pcm_seconds": first_pcm, "audio_seconds": audio_seconds,
-                "rtf": generation_seconds / audio_seconds, "base_seconds": base_seconds,
+                "rtf": generation_seconds / spoken_seconds, "base_seconds": base_seconds,
+                "spoken_seconds": spoken_seconds, "sentence_gap_seconds": float(sentence_gap),
+                "inserted_silence_seconds": silence_frames / sample_rate,
                 "conversion_seconds": conversion_seconds, "phrases": len(phrases),
                 "max_phrase_gap_seconds": max(gaps, default=0.0), "sample_rate": sample_rate,
                 "peak_before_clip": peak, "clipped_fraction": clipped_samples / frames,
@@ -337,7 +372,7 @@ class Engine:
                 "planning_seconds": delivery_plan["planning_seconds"] if delivery_plan else 0.0,
             }
             report = {"job_id": job_id, "profile_id": profile_id, "text": text, "seed": seed,
-                      "speed": speed, "backend_signature": signature, "backend": self.backend.info(),
+                      "speed": speed, "sentence_gap": float(sentence_gap), "backend_signature": signature, "backend": self.backend.info(),
                       "metrics": metrics, "complete": True,
                       "delivery_plan": delivery_plan, "reference_delivery": self._reference_delivery}
             report_tmp = output_dir / f".{job_id}.json.part"

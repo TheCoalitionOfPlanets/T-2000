@@ -22,6 +22,8 @@ class Settings:
     f5_steps: int = 32
     t1000_root: Path = Path("../T-1000")
     t1000_python: Path = Path("../T-1000/.venv/bin/python")
+    t1000_profile: str = "low-vram"
+    t1000_runtime_source: Path | None = None
     max_upload_bytes: int = 16 * 1024 * 1024
     max_text_chars: int = 3000
     max_output_seconds: float = 120.0
@@ -48,6 +50,10 @@ class Settings:
         backend = os.environ.get("T2000_BACKEND", "melo-openvoice-v2").strip().lower()
         if backend not in {"melo-openvoice-v2", "f5-tts-v1", "t1000-soar", "t1000-mf2"}:
             raise T2000Error("T2000_BACKEND must be melo-openvoice-v2, f5-tts-v1, t1000-soar or t1000-mf2.")
+        t1000_profile = os.environ.get("T2000_T1000_PROFILE", "low-vram")
+        if t1000_profile not in {"low-vram", "high-vram"}:
+            raise T2000Error("T2000_T1000_PROFILE must be low-vram or high-vram.")
+        runtime_source = os.environ.get("T2000_T1000_RUNTIME_SOURCE")
         try:
             f5_steps = int(os.environ.get("T2000_F5_STEPS", "32"))
         except ValueError as exc:
@@ -68,6 +74,8 @@ class Settings:
             t1000_root=Path(os.environ.get("T2000_T1000_ROOT", "../T-1000")).expanduser().absolute(),
             t1000_python=Path(os.environ.get("T2000_T1000_PYTHON",
                                            "../T-1000/.venv/bin/python")).expanduser().absolute(),
+            t1000_profile=t1000_profile,
+            t1000_runtime_source=(Path(runtime_source).expanduser().absolute() if runtime_source else None),
         )
 
     @property

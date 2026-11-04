@@ -1,0 +1,67 @@
+name: t2000
+
+services:
+  studio:
+    image: t2000:gpu
+    build:
+      context: .
+      target: runtime
+    init: true
+    user: "1000:1000"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${T2000_PORT:-7861}:7861"
+    environment:
+      T2000_BACKEND: "${T2000_BACKEND:-t1000-mf2}"
+      T2000_TTS_DEVICE: cuda:0
+      T2000_CONVERTER_DEVICE: cuda:0
+      T2000_NUM_THREADS: "${T2000_NUM_THREADS:-4}"
+      OMP_NUM_THREADS: "${T2000_NUM_THREADS:-4}"
+      MKL_NUM_THREADS: "${T2000_NUM_THREADS:-4}"
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+      MAX_JOBS: "2"
+      T2000_F5_STEPS: "${T2000_F5_STEPS:-32}"
+      STT_MODEL_DIR: /app/data/models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${T2000_T1000_HOST_ROOT:-../T-1000}/apps/api/src"
+        target: /t1000/apps/api/src
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${T2000_T1000_HOST_ROOT:-../T-1000}/data/models"
+        target: /t1000/data/models
+        read_only: true
+        bind:
+          create_host_path: false
+      - cache:/app/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    shm_size: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 45s
+
+volumes:
+  cache:

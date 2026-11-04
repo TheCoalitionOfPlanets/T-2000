@@ -1,0 +1,16 @@
+# Isolated Docker worker environment; never install in the Melo/F5 environment.
+# Matches the installed T-1000 low-VRAM runtime and its pinned upstream source.
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+dots.tts @ git+https://github.com/studio-dots-ai/dots.tts.git@b65ca7149fb43b8fb8d52916aa12738deda7b188
+transformers==4.57.0
+librosa==0.11.0
+soundfile==0.13.1
+numpy==2.2.6
+pydantic==2.12.5
+PyYAML==6.0.3
+safetensors==0.8.0rc0
+gradio==6.17.3
+bitsandbytes==0.50.2
+accelerate==1.15.0
+soxr==1.1.0

@@ -31,6 +31,17 @@ See [the architecture and benchmark proposal](docs/architecture.md) for T-1000 r
 
 ## Start the studio
 
+On the configured NVIDIA GPU server, start the Docker studio with one command:
+
+```sh
+./start.sh
+```
+
+Open **http://127.0.0.1:7861** on that machine, or forward port 7861 over SSH.
+The launcher also releases the native T-1000 studio's GPU before starting.
+See [Docker setup and operations](docs/docker.md) for the first setup, persistent
+data, all four voice engines, and stop/log commands.
+
 Use Python 3.11 and [uv](https://docs.astral.sh/uv/). From this directory:
 
 ```sh

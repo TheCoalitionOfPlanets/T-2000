@@ -8,6 +8,10 @@ transcript recorded alongside it. This is bootstrap data, not a substitute for r
 recordings: quality is capped by the synthesis backend's own fidelity, and any of its
 artifacts will be baked into whatever is trained on this output.
 
+An existing dataset in the output directory is extended rather than replaced: its clips
+and transcripts are kept, --minutes is the total target across old and new clips, and
+sentences already recorded are never synthesized twice. Pass --fresh to start over.
+
 Usage:
   .venv/bin/python scripts/generate_voice_dataset.py jack
   .venv/bin/python scripts/generate_voice_dataset.py jack --minutes 30 --backend t1000-mf2
@@ -162,6 +166,35 @@ def slug(name: str) -> str:
     return value or "voice"
 
 
+def load_existing(output_dir: Path, clips_dir: Path) -> list[dict]:
+    """Clips already on disk, read back from transcripts.tsv so a run can extend them."""
+    transcripts = output_dir / "transcripts.tsv"
+    if not transcripts.exists():
+        return []
+    records = []
+    for line in transcripts.read_text().splitlines()[1:]:
+        if not line.strip():
+            continue
+        file, duration, text = line.split("\t", 2)
+        if (clips_dir / file).exists():
+            records.append({"file": file, "text": text, "duration_seconds": float(duration)})
+    return records
+
+
+def write_metadata(output_dir: Path, profile: dict, args, records: list[dict], total_seconds: float) -> None:
+    (output_dir / "transcripts.tsv").write_text(
+        "file\tduration_seconds\ttext\n" + "".join(
+            f"{row['file']}\t{row['duration_seconds']:.3f}\t{row['text']}\n" for row in records))
+    (output_dir / "manifest.json").write_text(json.dumps({
+        "voice_name": profile["name"], "profile_id": profile["id"], "backend": args.backend,
+        "device": args.device, "seed": args.seed, "clip_count": len(records),
+        "total_duration_seconds": total_seconds, "target_minutes": args.minutes,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "note": "Bootstrap data synthesized from a reference-conditioned backend, not real recordings. "
+               "Quality is capped by that backend's own fidelity.",
+    }, indent=2) + "\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("profile", help="Saved voice name or ID (for example: jack)")
@@ -172,6 +205,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="Shuffle and synthesis seed, for reproducibility")
     parser.add_argument("--max-consecutive-failures", type=int, default=5,
                         help="Abort if this many sentences in a row fail to synthesize")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore any existing clips and generate the whole dataset from scratch")
     args = parser.parse_args()
 
     settings = replace(Settings.from_env(), backend=args.backend, tts_device=args.device)
@@ -191,19 +226,32 @@ def main() -> None:
     clips_dir = output_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
 
+    records = [] if args.fresh else load_existing(output_dir, clips_dir)
+    already_done = {row["text"] for row in records}
+    total_seconds = sum(row["duration_seconds"] for row in records)
+    if records:
+        print(f"T-2000: found {len(records)} existing clips ({total_seconds / 60:.2f} min) in {output_dir}; "
+              f"extending to {args.minutes:g} minutes.")
+
+    target_seconds = args.minutes * 60
+    if total_seconds >= target_seconds:
+        print(f"T-2000: already at {total_seconds / 60:.2f} minutes, at or over the "
+              f"{args.minutes:g} minute target. Nothing to do (use --fresh to regenerate).")
+        return
+
     print(f"T-2000: warming {args.backend} for {profile['name']!r} ({profile['id'][:12]})...")
     started = time.perf_counter()
     engine.prepare_profile(profile["id"])
-    print(f"T-2000: warmed in {time.perf_counter() - started:.1f}s. Generating up to {args.minutes:g} minutes...")
+    print(f"T-2000: warmed in {time.perf_counter() - started:.1f}s. Generating "
+          f"{(target_seconds - total_seconds) / 60:.2f} more minutes...")
 
-    target_seconds = args.minutes * 60
     rng = random.Random(args.seed)
-    records = []
-    total_seconds = 0.0
     consecutive_failures = 0
     for index, text in enumerate(corpus(rng)):
         if total_seconds >= target_seconds:
             break
+        if text in already_done:
+            continue
         seed = (args.seed + index) % 2**32
         try:
             result = engine.generate(profile["id"], text, speed=1.0, seed=seed)
@@ -216,22 +264,19 @@ def main() -> None:
         consecutive_failures = 0
         job_id = result["job_id"]
         duration = result["metrics"]["audio_seconds"]
-        clip_name = f"{len(records) + 1:04d}.wav"
+        next_number = len(records) + 1
+        while (clips_dir / f"{next_number:04d}.wav").exists():  # gap in a resumed dataset
+            next_number += 1
+        clip_name = f"{next_number:04d}.wav"
         shutil.copy(settings.data_dir / "output" / f"{job_id}.wav", clips_dir / clip_name)
         records.append({"file": clip_name, "text": text, "duration_seconds": duration, "seed": seed})
+        already_done.add(text)
         total_seconds += duration
         print(f"  [{len(records):4d}] {duration:5.2f}s  ({total_seconds / 60:5.2f} / {args.minutes:g} min)  {text}")
+        # Flushed every clip, so a long run that is interrupted can be resumed in place.
+        write_metadata(output_dir, profile, args, records, total_seconds)
 
-    (output_dir / "transcripts.tsv").write_text(
-        "file\tduration_seconds\ttext\n" + "".join(
-            f"{row['file']}\t{row['duration_seconds']:.3f}\t{row['text']}\n" for row in records))
-    (output_dir / "manifest.json").write_text(json.dumps({
-        "voice_name": profile["name"], "profile_id": profile["id"], "backend": args.backend,
-        "device": args.device, "seed": args.seed, "clip_count": len(records),
-        "total_duration_seconds": total_seconds, "generated_at": datetime.now(timezone.utc).isoformat(),
-        "note": "Bootstrap data synthesized from a reference-conditioned backend, not real recordings. "
-               "Quality is capped by that backend's own fidelity.",
-    }, indent=2) + "\n")
+    write_metadata(output_dir, profile, args, records, total_seconds)
 
     print(f"\nT-2000: wrote {len(records)} clips, {total_seconds / 60:.2f} minutes, to {output_dir}")
 

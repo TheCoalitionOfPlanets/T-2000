@@ -9,7 +9,7 @@ recordings: quality is capped by the synthesis backend's own fidelity, and any o
 artifacts will be baked into whatever is trained on this output.
 
 Usage:
-  .venv/bin/python scripts/generate_voice_dataset.py jack --minutes 15
+  .venv/bin/python scripts/generate_voice_dataset.py jack
   .venv/bin/python scripts/generate_voice_dataset.py jack --minutes 30 --backend t1000-mf2
 """
 from __future__ import annotations
@@ -165,7 +165,7 @@ def slug(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("profile", help="Saved voice name or ID (for example: jack)")
-    parser.add_argument("--minutes", type=float, default=15.0, help="Target dataset duration in minutes")
+    parser.add_argument("--minutes", type=float, default=120.0, help="Target dataset duration in minutes")
     parser.add_argument("--backend", choices=BACKENDS, default="t1000-soar", help="Synthesis backend to use")
     parser.add_argument("--device", default="cuda:0", help="Device for the synthesis backend")
     parser.add_argument("--output-dir", type=Path, help="Defaults to data/voice_datasets/<voice>")

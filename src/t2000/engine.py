@@ -36,6 +36,9 @@ class Engine:
         self._lock = threading.Lock()
         self.loaded = False
         self._reference_delivery = None
+        # The last completed preparation, so repeat requests for one voice skip
+        # re-hashing the reference, re-sending conditioning and re-measuring delivery.
+        self._prepared = None
 
     @property
     def backend(self) -> VoiceBackend:
@@ -137,6 +140,7 @@ class Engine:
         try:
             if backend_id != self.settings.backend:
                 previous = self._backend
+                self._prepared = None
                 self.close()
                 self._backend = None
                 del previous
@@ -159,6 +163,7 @@ class Engine:
             self._lock.release()
 
     def close(self) -> None:
+        self._prepared = None
         if self._backend is not None:
             close = getattr(self._backend, "close", None)
             if close is not None:
@@ -197,10 +202,16 @@ class Engine:
         load_seconds = time.perf_counter() - started
         self.loaded = True
         self._check(cancel)
-        emit({"type": "preparing"})
         started = time.perf_counter()
         profile = self.store.get(profile_id)
         signature = self.backend.signature()
+        key = (profile_id, profile["audio_sha256"], profile["transcript"], self.settings.backend, signature)
+        if self._prepared is not None and self._prepared["key"] == key:
+            # The identical reference is already conditioned in this loaded backend.
+            self._reference_delivery = self._prepared["reference_delivery"]
+            return self._prepared["cache_dir"], signature, load_seconds, time.perf_counter() - started
+        self._prepared = None
+        emit({"type": "preparing"})
         cache_dir = self.store.conditioning_dir(profile_id, signature, transcript=profile["transcript"])
         self.backend.prepare(self.store.reference_path(profile_id), cache_dir, reference_text=profile["transcript"])
         self._reference_delivery = None
@@ -218,6 +229,8 @@ class Engine:
                 self._reference_delivery = {"available": False, "reason": str(exc)}
         prepare_seconds = time.perf_counter() - started
         self._check(cancel)
+        self._prepared = {"key": key, "cache_dir": cache_dir,
+                          "reference_delivery": self._reference_delivery}
         return cache_dir, signature, load_seconds, prepare_seconds
 
     def prepare_profile(self, profile_id: str) -> dict:
@@ -303,7 +316,10 @@ class Engine:
                     if not 8000 <= rate <= 96000 or (sample_rate is not None and sample_rate != rate):
                         raise T2000Error("The model changed its output sample rate.")
                     if (frames + pcm.size) / rate > self.settings.max_output_seconds:
-                        raise T2000Error("Generated audio exceeded the 120-second limit. Use shorter text.")
+                        raise T2000Error(
+                            f"Generated audio exceeded the {self.settings.max_output_seconds:g}-second limit. "
+                            "Use shorter text."
+                        )
                     chunk_peak = float(np.max(np.abs(pcm)))
                     if chunk_peak <= 1e-7:
                         raise T2000Error("The model produced silent audio.")

@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const MAX_OUTPUT_SECONDS = 120;
+const MAX_OUTPUT_SECONDS = 600;
 const ENGINE_LABELS = {
   't1000-soar': 'T-1000 SOAR · Reference quality',
   't1000-mf2': 'T-1000 MF2 · Faster reference',
@@ -696,7 +696,7 @@ async function generate() {
           if (playback.sampleRate && playback.sampleRate !== header.sample_rate) throw new Error('The audio sample rate changed during generation.');
           playback.sampleRate = header.sample_rate;
           playback.frames += header.frames;
-          if (playback.frames > header.sample_rate * MAX_OUTPUT_SECONDS) throw new Error('The generated output exceeded two minutes. Please use a shorter request.');
+          if (playback.frames > header.sample_rate * MAX_OUTPUT_SECONDS) throw new Error('The generated output exceeded the output limit. Please use shorter text.');
           const samples = new Float32Array(header.frames);
           const view = new DataView(data);
           for (let frame = 0; frame < samples.length; frame++) {

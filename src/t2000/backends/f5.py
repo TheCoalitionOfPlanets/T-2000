@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -275,7 +276,7 @@ class F5Backend:
                 if clipping > 0:
                     raise T2000Error("F5 produced clipped audio. Try another clean reference or seed.")
                 output_info = sf.info(output_path)
-                if output_info.channels != 1 or output_info.samplerate != 24000 or not 0 < output_info.duration <= 120:
+                if output_info.channels != 1 or output_info.samplerate != 24000 or not 0 < output_info.duration <= 600:
                     raise T2000Error("F5 produced invalid audio dimensions or duration.")
                 samples, rate = sf.read(output_path, dtype="float32", always_2d=True)
                 if (rate != 24000 or samples.shape[1] != 1 or not samples.size
@@ -314,12 +315,12 @@ class F5Backend:
                             process.wait(timeout=10)
                 for stream in (process.stdin, process.stdout):
                     if stream:
-                        # A failed flush leaves the data buffered, so closing raises
-                        # the same BrokenPipeError and would mask the real error.
-                        try:
+                        # A dead peer can still fail here: closing a buffered stdin
+                        # flushes it, and a worker killed between write() and flush()
+                        # (for example by the OOM killer) leaves it broken. That must
+                        # not shadow the caller's own exception with a bare EPIPE.
+                        with contextlib.suppress(OSError):
                             stream.close()
-                        except OSError:
-                            pass
             if self._stderr is not None:
                 self._stderr.close()
                 self._stderr = None

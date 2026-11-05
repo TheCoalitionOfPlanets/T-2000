@@ -185,3 +185,15 @@ def test_invalid_generation_settings(setup_engine, options):
     engine, profile, _ = setup_engine
     with pytest.raises(T2000Error):
         engine.generate(profile["id"], "Hello.", **options)
+
+
+def test_repeat_requests_reuse_one_preparation_until_the_voice_changes(setup_engine):
+    engine, profile, backend = setup_engine
+    for _ in range(2):
+        engine.generate(profile["id"], "Hello there.")
+    assert len(backend.prepared) == 1
+    # A corrected transcript conditions the backend again.
+    engine.store.update_transcript(profile["id"], "Corrected words")
+    engine.generate(profile["id"], "Hello there.")
+    assert len(backend.prepared) == 2
+    assert backend.reference_texts[-1] == "Corrected words"

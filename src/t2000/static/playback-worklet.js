@@ -95,8 +95,8 @@ class StreamPlayback extends AudioWorkletProcessor {
       return;
     }
     this.sourceRate = data.sample_rate;
-    if (this.frames + data.samples.length > this.sourceRate * 120) {
-      this.fail('Playback is more than two minutes behind. Please use a shorter request.');
+    if (this.frames + data.samples.length > this.sourceRate * 600) {
+      this.fail('Playback buffer exceeded the output limit. Please use shorter text.');
       return;
     }
     this.sequence++;

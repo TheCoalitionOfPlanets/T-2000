@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">
+  <title>Voice</title><link rel="stylesheet" href="/static/solo.css">
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
+    <symbol id="icon-audio" viewBox="0 0 24 24"><path d="M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 17v4h16v-4"/></symbol>
+    <symbol id="icon-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
+  </defs></svg>
+  <main class="solo-shell">
+    <header class="solo-header">
+      <div class="voice-identity">
+        <span class="voice-mark"><svg class="icon" width="22" height="22"><use href="#icon-audio"/></svg></span>
+        <div>
+          <h1 id="app-title">Voice</h1>
+          <p class="voice-line">One voice: <strong id="voice-name">loading…</strong><span id="voice-detail"></span></p>
+        </div>
+      </div>
+      <div class="voice-state"><span id="warm-state" class="warm-state" role="status"><i aria-hidden="true"></i>Connecting…</span><span id="engine-name" class="engine-name"></span></div>
+    </header>
+
+    <section class="panel" aria-labelledby="say-title">
+      <div class="panel-heading"><h2 id="say-title">What should it say?</h2><span id="character-count" class="small-label">0 / 3,000</span></div>
+      <label class="sr-only" for="speech-text">Text to speak</label>
+      <textarea id="speech-text" maxlength="3000" spellcheck="true" placeholder="Write a sentence or a few paragraphs…">Hello. This is my voice, with something new to say.</textarea>
+      <div class="controls">
+        <div class="range-field">
+          <div class="range-label"><label id="speed-label" for="speech-speed">Speaking speed</label><output id="speed-value" for="speech-speed">1.0×</output></div>
+          <input id="speech-speed" type="range" min="0.7" max="1.4" step="0.05" value="1">
+        </div>
+        <div class="seed-field"><label for="speech-seed">Seed</label><input id="speech-seed" type="number" min="0" max="4294967295" step="1" value="42"></div>
+      </div>
+      <div class="actions">
+        <span class="hint"><kbd>⌘ / Ctrl + Enter</kbd></span>
+        <button id="stop-button" type="button" class="ui-button ui-button-outline" disabled>Stop</button>
+        <button id="speak-button" type="button" class="ui-button ui-button-default"><svg class="icon" width="17" height="17"><use href="#icon-audio"/></svg>Speak<svg class="icon" width="16" height="16"><use href="#icon-arrow"/></svg></button>
+      </div>
+    </section>
+
+    <section class="panel output-panel" id="listening-room" aria-labelledby="output-title">
+      <div class="panel-heading"><h2 id="output-title">Output</h2><a id="download-link" class="download-link" download hidden><svg class="icon" width="15" height="15"><use href="#icon-download"/></svg>Download WAV</a></div>
+      <audio id="output-player" controls preload="metadata" aria-label="Generated speech" hidden></audio>
+      <p id="session-status" class="session-status" role="status" aria-live="polite">Warming this voice…</p>
+      <div class="metrics" aria-label="Generation measurements">
+        <div><span>First audible <small>estimated</small></span><strong id="metric-audible">—</strong></div>
+        <div><span>Generation</span><strong id="metric-generation">—</strong></div>
+        <div><span>Real-time factor</span><strong id="metric-rtf">—</strong></div>
+        <div><span>Playback gaps</span><strong id="metric-gaps">—</strong></div>
+      </div>
+    </section>
+
+    <footer class="solo-footer"><span><svg class="icon" width="14" height="14"><use href="#icon-shield"/></svg>Runs on your machine. This app speaks with one saved voice only.</span><a href="/api/reference" target="_blank" rel="noopener">Hear the reference</a></footer>
+  </main>
+  <script type="module" src="/static/solo.js"></script>
+</body>
+</html>

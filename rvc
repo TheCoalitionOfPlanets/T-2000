@@ -1,0 +1,1 @@
+.venv/bin/python scripts/generate_voice_dataset.py jack --minutes 15 --backend t1000-soar --device cuda:0

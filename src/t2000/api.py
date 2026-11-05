@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class GenerationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile_id: str = Field(pattern=r"^[a-f0-9]{64}$")
-    text: str = Field(min_length=1, max_length=3000)
+    text: str = Field(min_length=1, max_length=6000)
     speed: float = Field(default=1.0, ge=0.7, le=1.4, allow_inf_nan=False)
     seed: int = Field(default=42, ge=0, le=0xFFFFFFFF, strict=True)
     sentence_gap: float = Field(default=0.0, ge=0, le=MAX_SENTENCE_GAP, allow_inf_nan=False)
@@ -47,6 +47,89 @@ def _same_origin(origin: str | None, host: str) -> bool:
         return True  # Non-browser CLI clients do not send Origin.
     parsed = urlsplit(origin)
     return parsed.scheme in {"http", "https"} and parsed.netloc == host
+
+
+async def stream_generation(socket: WebSocket, engine: Engine, slots: threading.BoundedSemaphore,
+                            request: dict) -> None:
+    """Run one accepted, validated speech request and pump its events to the socket."""
+    if not slots.acquire(blocking=False):
+        await socket.send_json({"type": "error", "message": "The generation queue is full. Try again shortly."})
+        await socket.close(code=1013)
+        return
+    events = queue.Queue(maxsize=8)
+    cancel = threading.Event()
+    disconnected = threading.Event()
+    finished = threading.Event()
+
+    def emit(event):
+        while not disconnected.is_set():
+            if event["type"] not in {"error", "cancelled", "complete"} and cancel.is_set():
+                raise Cancelled("Generation cancelled.")
+            try:
+                events.put(event, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+        raise Cancelled("Playback disconnected.")
+
+    def work():
+        try:
+            result = engine.generate(**request, emit=emit, cancel=cancel)
+            emit(result)
+        except Cancelled:
+            with contextlib.suppress(Cancelled):
+                emit({"type": "cancelled", "message": "Generation cancelled."})
+        except Exception as exc:
+            logger.exception("Speech generation failed")
+            message = str(exc) if isinstance(exc, T2000Error) else "Generation failed. Check server logs."
+            with contextlib.suppress(Cancelled):
+                emit({"type": "error", "message": message})
+        finally:
+            slots.release()
+            finished.set()
+
+    async def receive_cancel():
+        try:
+            while True:
+                message = await socket.receive_json()
+                if message == {"type": "cancel"}:
+                    cancel.set()
+        except (WebSocketDisconnect, ValueError, RuntimeError, KeyError):
+            disconnected.set()
+            cancel.set()
+
+    worker = threading.Thread(target=work, daemon=True, name="t2000-generation")
+    worker.start()
+    receiver = asyncio.create_task(receive_cancel())
+    try:
+        while not disconnected.is_set():
+            try:
+                event = await asyncio.to_thread(events.get, True, 0.2)
+            except queue.Empty:
+                if finished.is_set():
+                    break
+                continue
+            if cancel.is_set() and event["type"] == "audio":
+                continue
+            if event["type"] == "audio":
+                event = dict(event)
+                pcm = event.pop("pcm")
+                await asyncio.wait_for(socket.send_json(event), timeout=10)
+                await asyncio.wait_for(socket.send_bytes(pcm), timeout=10)
+            else:
+                await asyncio.wait_for(socket.send_json(event), timeout=10)
+            if event["type"] in {"complete", "cancelled", "error"}:
+                break
+    except (WebSocketDisconnect, RuntimeError, TimeoutError):
+        pass
+    finally:
+        cancel.set()
+        disconnected.set()
+        receiver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await receiver
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+            await socket.close()
 
 
 def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
@@ -220,84 +303,7 @@ def create_app(settings: Settings | None = None, backend=None) -> FastAPI:
             return
         except WebSocketDisconnect:
             return
-        if not slots.acquire(blocking=False):
-            await socket.send_json({"type": "error", "message": "The generation queue is full. Try again shortly."})
-            await socket.close(code=1013)
-            return
-        events = queue.Queue(maxsize=8)
-        cancel = threading.Event()
-        disconnected = threading.Event()
-        finished = threading.Event()
-
-        def emit(event):
-            while not disconnected.is_set():
-                if event["type"] not in {"error", "cancelled", "complete"} and cancel.is_set():
-                    raise Cancelled("Generation cancelled.")
-                try:
-                    events.put(event, timeout=0.1)
-                    return
-                except queue.Full:
-                    continue
-            raise Cancelled("Playback disconnected.")
-
-        def work():
-            try:
-                result = engine.generate(**request.model_dump(), emit=emit, cancel=cancel)
-                emit(result)
-            except Cancelled:
-                with contextlib.suppress(Cancelled):
-                    emit({"type": "cancelled", "message": "Generation cancelled."})
-            except Exception as exc:
-                logger.exception("Speech generation failed")
-                message = str(exc) if isinstance(exc, T2000Error) else "Generation failed. Check server logs."
-                with contextlib.suppress(Cancelled):
-                    emit({"type": "error", "message": message})
-            finally:
-                slots.release()
-                finished.set()
-
-        async def receive_cancel():
-            try:
-                while True:
-                    message = await socket.receive_json()
-                    if message == {"type": "cancel"}:
-                        cancel.set()
-            except (WebSocketDisconnect, ValueError, RuntimeError, KeyError):
-                disconnected.set()
-                cancel.set()
-
-        worker = threading.Thread(target=work, daemon=True, name="t2000-generation")
-        worker.start()
-        receiver = asyncio.create_task(receive_cancel())
-        try:
-            while not disconnected.is_set():
-                try:
-                    event = await asyncio.to_thread(events.get, True, 0.2)
-                except queue.Empty:
-                    if finished.is_set():
-                        break
-                    continue
-                if cancel.is_set() and event["type"] == "audio":
-                    continue
-                if event["type"] == "audio":
-                    event = dict(event)
-                    pcm = event.pop("pcm")
-                    await asyncio.wait_for(socket.send_json(event), timeout=10)
-                    await asyncio.wait_for(socket.send_bytes(pcm), timeout=10)
-                else:
-                    await asyncio.wait_for(socket.send_json(event), timeout=10)
-                if event["type"] in {"complete", "cancelled", "error"}:
-                    break
-        except (WebSocketDisconnect, RuntimeError, TimeoutError):
-            pass
-        finally:
-            cancel.set()
-            disconnected.set()
-            receiver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await receiver
-            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
-                await socket.close()
+        await stream_generation(socket, engine, slots, request.model_dump())
 
     static = Path(__file__).parent / "static"
     app.mount("/static", StaticFiles(directory=static), name="assets")

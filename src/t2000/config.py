@@ -25,8 +25,8 @@ class Settings:
     t1000_profile: str = "low-vram"
     t1000_runtime_source: Path | None = None
     max_upload_bytes: int = 16 * 1024 * 1024
-    max_text_chars: int = 3000
-    max_output_seconds: float = 120.0
+    max_text_chars: int = 6000
+    max_output_seconds: float = 600.0
     phrase_chars: int = 180
 
     @classmethod

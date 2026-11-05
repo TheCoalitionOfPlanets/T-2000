@@ -108,6 +108,33 @@ The studio shows estimated first-audible latency, generation time, real-time fac
 
 To reuse T-1000's downloaded recognition weights, point `STT_MODEL_DIR` at that model directory. Otherwise download explicitly with `.venv/bin/python scripts/fetch_stt.py`. A manual reference transcript works without STT; CLI enrollment can opt out with `--no-transcribe`. The plots describe reference acoustics; they do not certify identity, emotion or smoothness.
 
+## A standalone app for one voice
+
+Once a voice is saved, serve it on its own. The app speaks with that voice only: no
+profile list, no enrollment, no engine switching — just words in, speech out.
+
+```sh
+.venv/bin/t2000 voice --list               # saved voices, with the IDs to serve them by
+.venv/bin/t2000 voice 'Prieyan'            # http://127.0.0.1:7862, titled Prieyan-TTS
+.venv/bin/t2000 voice 'Prieyan' --port 7870 --title 'Prieyan-TTS'
+.venv/bin/t2000 voice PROFILE_ID_PREFIX --no-warm
+```
+
+Name the voice by its saved name, its profile ID, or an unambiguous ID prefix; an
+ambiguous name is refused rather than guessed. `--list` prints every saved voice with its
+ID, length, date and transcript, marking names shared by more than one voice. The chosen voice is fixed when the app
+starts, so a client request carries only text, speed and seed.
+
+It starts faster than the studio for repeat requests: the engine loads and the voice is
+conditioned at startup (`--no-warm` defers that to the first request), and a request that
+reuses an unchanged reference, transcript and engine skips reloading, re-conditioning and
+re-measuring delivery. The studio gets the same reuse. Editing the transcript or switching
+engines conditions the voice again. Model inference time itself is unchanged.
+
+Endpoints: `GET /api/voice` (the served voice and its warm state), `POST /api/warm`,
+`GET /api/reference`, `WS /api/speak`, `GET /api/output/{id}.wav`. Run one process per
+GPU, as with the studio.
+
 ## CLI and benchmarking
 
 ```sh

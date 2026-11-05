@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 
@@ -260,3 +261,53 @@ def test_worker_start_failure_releases_temporary_stderr(tmp_path, monkeypatch):
     with pytest.raises(T2000Error, match="Could not start"):
         backend.load()
     assert backend._stderr is None and backend._process is None
+
+
+def test_close_does_not_mask_the_real_error_with_a_broken_pipe(tmp_path, monkeypatch):
+    """A worker killed between write() and flush() (for example by the OOM killer)
+    leaves its stdin broken. close() used to re-raise EPIPE while tidying up that
+    stream, which replaced the caller's actual, diagnosable error with a bare
+    "[Errno 32] Broken pipe" and no indication of what actually happened.
+    """
+    backend = F5Backend(tmp_path, python_executable=Path(sys.executable))
+    monkeypatch.setattr(backend, "signature", lambda: "test-signature")
+
+    class DeadStdin:
+        def write(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def close(self):
+            # Flushing on close surfaces the same broken pipe a second time.
+            raise BrokenPipeError(32, "Broken pipe")
+
+    class DeadProcess:
+        stdin = DeadStdin()
+        stdout = DeadStdin()
+
+        def poll(self):
+            return None  # Not yet reaped, matching the real race.
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return -9
+
+    backend._process = DeadProcess()
+    backend._stderr = tempfile.TemporaryFile()
+    backend._stderr.write(b"worker died loading the model\n")
+    # close() must swallow the dead pipe, not raise through it.
+    backend.close()
+    assert backend._process is None
+
+    # The same scenario reached through _exchange(), where the masking bug
+    # actually surfaced: the real error must come through, not a bare EPIPE.
+    backend._process = DeadProcess()
+    backend._stderr = tempfile.TemporaryFile()
+    backend._stderr.write(b"worker died loading the model\n")
+    with pytest.raises(T2000Error, match="worker output: worker died loading the model") as excinfo:
+        backend._exchange({"command": "load"})
+    assert "F5 generation failed" in str(excinfo.value)

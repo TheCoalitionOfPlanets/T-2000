@@ -1,12 +1,13 @@
 """Content-addressed reference artifacts and versioned conditioning cache paths."""
 
+import contextlib
 from datetime import datetime, timezone
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 
 import numpy as np
@@ -139,18 +140,49 @@ class ProfileStore:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _exclusive(directory: Path):
+        """Hold an exclusive lock on a profile directory across processes and threads."""
+        if sys.platform == "win32":
+            # Windows cannot open a directory as a file descriptor, so lock a sidecar
+            # file instead. msvcrt.locking blocks until the byte range is free.
+            import msvcrt
+
+            guard = os.open(directory / ".metadata.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                msvcrt.locking(guard, msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    msvcrt.locking(guard, msvcrt.LK_UNLCK, 1)
+            finally:
+                os.close(guard)
+            return
+
+        # A directory lock avoids a lock-file symlink and works across store instances,
+        # threads and CLI/server processes.
+        import fcntl
+
+        guard = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(guard, fcntl.LOCK_UN)
+            os.close(guard)
+
     def update_transcript(self, profile_id: str, text: str, *, only_if_empty: bool = False) -> dict:
         """Serialize metadata updates; late ASR must not replace a user's correction."""
         transcript = self._transcript(text)
         directory = self._directory(profile_id)
-        # A directory lock avoids a lock-file symlink and works across store instances,
-        # threads and CLI/server processes. Read the current metadata only after locking.
+        # Read the current metadata only after locking.
         try:
-            guard = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            lock = self._exclusive(directory)
+            lock.__enter__()
         except OSError as exc:
             raise T2000Error("This reference profile is unavailable. Enroll a recording first.") from exc
         try:
-            fcntl.flock(guard, fcntl.LOCK_EX)
             metadata = self.get(profile_id)
             if only_if_empty and metadata["transcript"]:
                 return metadata
@@ -164,5 +196,4 @@ class ProfileStore:
                 Path(temporary).unlink(missing_ok=True)
             return metadata
         finally:
-            fcntl.flock(guard, fcntl.LOCK_UN)
-            os.close(guard)
+            lock.__exit__(None, None, None)

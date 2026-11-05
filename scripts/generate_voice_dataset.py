@@ -19,12 +19,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import replace
 import json
 import random
 import re
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -207,7 +209,13 @@ def main() -> None:
                         help="Abort if this many sentences in a row fail to synthesize")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore any existing clips and generate the whole dataset from scratch")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Synthesis processes to run concurrently. Each holds its own copy of "
+                             "the model on the GPU, so the ceiling is VRAM: at batch size 1 a single "
+                             "stream leaves the GPU mostly idle, and concurrency is what fills it.")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("Use at least one worker.")
 
     settings = replace(Settings.from_env(), backend=args.backend, tts_device=args.device)
     store = ProfileStore(settings.data_dir / "profiles")
@@ -239,44 +247,93 @@ def main() -> None:
               f"{args.minutes:g} minute target. Nothing to do (use --fresh to regenerate).")
         return
 
-    print(f"T-2000: warming {args.backend} for {profile['name']!r} ({profile['id'][:12]})...")
+    # One shared, numbered sentence stream. Each worker pulls the next unused sentence,
+    # so concurrency never duplicates work and the seed stays tied to corpus position.
+    rng = random.Random(args.seed)
+    supply = enumerate(corpus(rng))
+    state = {"total_seconds": total_seconds, "failures": 0, "stop": None}
+    guard = threading.Lock()
+
+    def next_sentence():
+        with guard:
+            if state["stop"] is not None or state["total_seconds"] >= target_seconds:
+                return None
+            for index, text in supply:
+                if text not in already_done:
+                    already_done.add(text)
+                    return index, text
+            return None
+
+    def record_clip(text, seed, result):
+        job_id = result["job_id"]
+        duration = result["metrics"]["audio_seconds"]
+        with guard:
+            next_number = len(records) + 1
+            while (clips_dir / f"{next_number:04d}.wav").exists():  # gap in a resumed dataset
+                next_number += 1
+            clip_name = f"{next_number:04d}.wav"
+            # Reserve the name inside the lock; the copy below cannot be allowed to race.
+            (clips_dir / clip_name).touch()
+        shutil.copy(settings.data_dir / "output" / f"{job_id}.wav", clips_dir / clip_name)
+        with guard:
+            records.append({"file": clip_name, "text": text, "duration_seconds": duration, "seed": seed})
+            state["total_seconds"] += duration
+            state["failures"] = 0
+            print(f"  [{len(records):4d}] {duration:5.2f}s  "
+                  f"({state['total_seconds'] / 60:5.2f} / {args.minutes:g} min)  {text}")
+            # Flushed every clip, so a long run that is interrupted can be resumed in place.
+            write_metadata(output_dir, profile, args, records, state["total_seconds"])
+
+    def synthesize(worker_engine):
+        while True:
+            item = next_sentence()
+            if item is None:
+                return
+            index, text = item
+            seed = (args.seed + index) % 2**32
+            try:
+                result = worker_engine.generate(profile["id"], text, speed=1.0, seed=seed)
+            except T2000Error as exc:
+                with guard:
+                    state["failures"] += 1
+                    print(f"  [skip] {text!r}: {exc}")
+                    if state["failures"] >= args.max_consecutive_failures:
+                        state["stop"] = (f"T-2000: {state['failures']} sentences in a row failed; "
+                                         f"stopping.")
+                        return
+                continue
+            record_clip(text, seed, result)
+
+    print(f"T-2000: warming {args.backend} for {profile['name']!r} ({profile['id'][:12]}) "
+          f"on {args.workers} worker{'s' if args.workers > 1 else ''}...")
     started = time.perf_counter()
-    engine.prepare_profile(profile["id"])
+    engines = [engine]
+    for _ in range(args.workers - 1):
+        engines.append(Engine(settings, ProfileStore(settings.data_dir / "profiles")))
+    for worker_engine in engines:
+        worker_engine.prepare_profile(profile["id"])
     print(f"T-2000: warmed in {time.perf_counter() - started:.1f}s. Generating "
           f"{(target_seconds - total_seconds) / 60:.2f} more minutes...")
 
-    rng = random.Random(args.seed)
-    consecutive_failures = 0
-    for index, text in enumerate(corpus(rng)):
-        if total_seconds >= target_seconds:
-            break
-        if text in already_done:
-            continue
-        seed = (args.seed + index) % 2**32
-        try:
-            result = engine.generate(profile["id"], text, speed=1.0, seed=seed)
-        except T2000Error as exc:
-            consecutive_failures += 1
-            print(f"  [skip] {text!r}: {exc}")
-            if consecutive_failures >= args.max_consecutive_failures:
-                raise SystemExit(f"T-2000: {consecutive_failures} sentences in a row failed; stopping.")
-            continue
-        consecutive_failures = 0
-        job_id = result["job_id"]
-        duration = result["metrics"]["audio_seconds"]
-        next_number = len(records) + 1
-        while (clips_dir / f"{next_number:04d}.wav").exists():  # gap in a resumed dataset
-            next_number += 1
-        clip_name = f"{next_number:04d}.wav"
-        shutil.copy(settings.data_dir / "output" / f"{job_id}.wav", clips_dir / clip_name)
-        records.append({"file": clip_name, "text": text, "duration_seconds": duration, "seed": seed})
-        already_done.add(text)
-        total_seconds += duration
-        print(f"  [{len(records):4d}] {duration:5.2f}s  ({total_seconds / 60:5.2f} / {args.minutes:g} min)  {text}")
-        # Flushed every clip, so a long run that is interrupted can be resumed in place.
-        write_metadata(output_dir, profile, args, records, total_seconds)
+    try:
+        if len(engines) == 1:
+            synthesize(engines[0])
+        else:
+            threads = [threading.Thread(target=synthesize, args=(worker_engine,), daemon=True)
+                       for worker_engine in engines]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+    finally:
+        write_metadata(output_dir, profile, args, records, state["total_seconds"])
+        for worker_engine in engines[1:]:
+            with contextlib.suppress(Exception):
+                worker_engine.close()
 
-    write_metadata(output_dir, profile, args, records, total_seconds)
+    total_seconds = state["total_seconds"]
+    if state["stop"]:
+        raise SystemExit(state["stop"])
 
     print(f"\nT-2000: wrote {len(records)} clips, {total_seconds / 60:.2f} minutes, to {output_dir}")
 

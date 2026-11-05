@@ -9,10 +9,12 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import select
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,6 +55,8 @@ class F5Backend:
         self._worker_script = self._project / "scripts/f5_infer_worker.py"
         self._process = None
         self._stderr = None
+        self._reader_queue = None
+        self._reader_process = None
         self._lock = threading.RLock()
         self._loaded_signature = None
         self._identity_stamp = None
@@ -142,6 +146,62 @@ class F5Backend:
                 details.append("worker output: " + " | ".join(lines))
         return "; ".join(details)
 
+    def _reader_lines(self):
+        """Windows-only: a thread turns the worker's stdout pipe into a bounded-wait queue.
+
+        select() on Windows accepts sockets only, so the pipe cannot be polled directly.
+        One daemon reader per worker process preserves the deadline semantics of the
+        POSIX path; a sentinel marks the worker closing its stdout.
+        """
+        if self._reader_process is not self._process:
+            stdout, lines = self._process.stdout, queue.Queue()
+
+            def pump():
+                try:
+                    for line in iter(stdout.readline, ""):
+                        lines.put(line)
+                finally:
+                    lines.put(None)
+
+            self._reader_queue = lines
+            self._reader_process = self._process
+            threading.Thread(target=pump, daemon=True).start()
+        return self._reader_queue
+
+    def _response_line(self, deadline):
+        """One newline-terminated worker response, or a timeout at the deadline."""
+        if sys.platform == "win32":
+            lines = self._reader_lines()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("F5 inference exceeded its response deadline")
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError("F5 inference exceeded its response deadline") from None
+            if line is None:
+                raise RuntimeError("F5 worker exited before returning audio")
+            received = line.encode("utf-8")
+            if len(received) > 1024 * 1024:
+                raise ValueError("F5 worker response exceeds 1 MiB")
+            return received
+
+        received = bytearray()
+        while b"\n" not in received:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("F5 inference exceeded its response deadline")
+            ready, _, _ = select.select([self._process.stdout], [], [], remaining)
+            if not ready:
+                raise TimeoutError("F5 inference exceeded its response deadline")
+            block = os.read(self._process.stdout.fileno(), 65536)
+            if not block:
+                raise RuntimeError("F5 worker exited before returning audio")
+            received.extend(block)
+            if len(received) > 1024 * 1024:
+                raise ValueError("F5 worker response exceeds 1 MiB")
+        return bytes(received)
+
     def _exchange(self, request, timeout=600):
         if self._process is None or self._process.poll() is not None:
             raise T2000Error("The F5 worker stopped. Prepare the voice again or restart the studio.")
@@ -150,20 +210,7 @@ class F5Backend:
             self._process.stdin.write(json.dumps(dict(request, request_id=identity)) + "\n")
             self._process.stdin.flush()
             deadline = time.monotonic() + timeout
-            received = bytearray()
-            while b"\n" not in received:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("F5 inference exceeded its response deadline")
-                ready, _, _ = select.select([self._process.stdout], [], [], remaining)
-                if not ready:
-                    raise TimeoutError("F5 inference exceeded its response deadline")
-                block = os.read(self._process.stdout.fileno(), 65536)
-                if not block:
-                    raise RuntimeError("F5 worker exited before returning audio")
-                received.extend(block)
-                if len(received) > 1024 * 1024:
-                    raise ValueError("F5 worker response exceeds 1 MiB")
+            received = self._response_line(deadline)
             response = json.loads(received.decode("utf-8"))
             if not isinstance(response, dict):
                 raise ValueError("F5 worker response must be an object")
